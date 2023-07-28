@@ -1,0 +1,1902 @@
+---
+title: "COVID Microglia deepseq Analysis"
+output:
+  html_document:
+    df_print: paged
+---
+
+# Setup   
+## Goals   
+1. Perform more final analysis with Seurat and SCVI integration to identify key COVID-associated clusters of microglia (and potentially CD8+ T cells)       
+   
+## Import packages   
+```{r setup}
+library(Seurat) 
+library(tidyseurat)
+library(tidyverse)
+library(ggsci)
+library(pheatmap)
+library(RColorBrewer)
+library(viridis)
+library(Cairo)
+library(dittoSeq)
+library(circlize)
+library(readxl)
+library(RPushbullet)
+library(gridExtra)
+library(biomaRt)
+library(ComplexHeatmap)
+library(circlize)
+library(emmeans)
+library(ggrepel)
+library(plotly)
+library(reticulate)
+library(fgsea)
+library(corrplot)
+library(broom)
+library(ggsignif)
+library(patchwork)
+library(ggplotify)
+
+#set up parallelization
+library(future)
+plan("multisession", workers = 4)
+options(future.globals.maxSize = 30*1024^3)
+options(future.seed=TRUE)
+
+#custom scripts
+source("~/utils/R/Seurat_pseudobulk_DEA.R")
+source("~/utils/R/pretty_MA_plot.R")
+source("~/utils/R/plotPCA_manual.R")
+
+#palettes
+nature_pal = pal_npg("nrc")(9)
+set.seed(666)
+futurama_pal = sample(colorRampPalette(pal_futurama()(9))(19))
+simpsons_pal = pal_simpsons()(9)
+nature_pal_long = colorRampPalette(pal_npg("nrc")(9))(11)
+#shuffle for readability
+set.seed(666)
+nature_pal_20 = colorRampPalette(pal_npg("nrc")(9))(21)
+nature_pal_20 = sample(nature_pal_20)
+
+#for reticulate, use venv
+use_python("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/human_microglia_venv/bin/python3", required = T)
+
+#get ensembl gene ids
+gene_conv = read.table(gzfile("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_batch1/cellranger/SC224/outs/filtered_feature_bc_matrix/features.tsv.gz"), 
+                       col.names = c("id", "feature", "type", "assay")) %>% 
+  dplyr::select(-c(type, assay)) %>% 
+  dplyr::mutate(ensembl_gene_id = gsub("GRCh38_______________", "", id),
+                external_gene_name = gsub("GRCh38_______________", "", feature),
+                id = gsub("_______________", "-", id),
+                feature = gsub("_______________", "-", feature))
+
+human_mart = useMart("ensembl", "hsapiens_gene_ensembl")
+entrez_conv = getBM(c("ensembl_gene_id", "entrezgene_id"), mart = human_mart)
+
+gene_conv = left_join(gene_conv, entrez_conv)
+
+#for magick
+dyn.load("/hpc/software/ImageMagick/7.1.0-31/lib/libMagick++-7.Q16HDRI.so.5.0.0")
+dyn.load("/hpc/software/poppler/0.48/lib/libpoppler-cpp.so.0")
+```
+   
+# Import data   
+```{r}
+integrated = readRDS("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/analysis/230110_human_microglia_SCVI_integrated.rds")
+print(integrated)
+```
+   
+# QC Summary
+### Reads   
+```{r}
+ncount_plot = integrated %>%
+  tidyseurat::ggplot(aes(x = orig.ident, y = nCount_RNA, fill = orig.ident)) +
+  geom_boxplot() +
+  scale_y_log10() +
+  theme_bw(base_family = "Arial") +
+  scale_fill_npg()
+ncount_plot
+
+nfeature_plot = integrated %>%
+  tidyseurat::ggplot(aes(x = orig.ident, y = nFeature_RNA, fill = orig.ident)) +
+  geom_boxplot() +
+  scale_y_log10() +
+  theme_bw(base_family = "Arial") +
+  scale_fill_npg()
+nfeature_plot
+```   
+   
+```{r}
+CairoPDF("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/230110_nfeature_plot.pdf",
+    width = 8,
+    height = 6, 
+    family = "Arial")
+nfeature_plot
+dev.off()
+CairoPNG("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/230110_nfeature_plot.png",
+    width = 8,
+    height = 6, 
+    units = "in",
+    dpi = 300,
+    family = "Arial")
+nfeature_plot
+dev.off()
+
+CairoPDF("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/230110_ncount_plot.pdf",
+    width = 8,
+    height = 6, 
+    family = "Arial")
+ncount_plot
+dev.off()
+CairoPNG("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/230110_ncount_plot.png",
+    width = 8,
+    height = 6, 
+    units = "in",
+    dpi = 300,
+    family = "Arial")
+ncount_plot
+dev.off()
+```
+
+Fairly even depth. We already knew about SC224.      
+   
+### Mitochondrial read percentage   
+```{r}
+# percent mito will likely be valuable for a dataset with few cell types
+mito_plot = ggplot(integrated, aes(x = orig.ident, y = pct_mito, fill = orig.ident)) +
+  geom_boxplot() +
+  theme_bw(base_family = "Arial") +
+  scale_fill_npg()
+mito_plot
+```   
+Consistently pretty low!   
+   
+```{r}
+CairoPDF("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/230110_pct_mito_plot.pdf",
+    width = 8,
+    height = 6, 
+    family = "Arial")
+mito_plot
+dev.off()
+CairoPNG("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/230110_pct_mito_plot.png",
+    width = 8,
+    height = 6, 
+    units = "in",
+    dpi = 300,
+    family = "Arial")
+mito_plot
+dev.off()
+```
+   
+## Dimensionality reduction   
+### UMAP embedding   
+```{r}
+integrated = FindNeighbors(integrated, dims = 1:10, verbose = FALSE, reduction = "SCVI")
+integrated = FindClusters(integrated, verbose = FALSE, random.seed = 12345, method = 4)
+integrated = RunUMAP(integrated, dims = 1:10, verbose = FALSE, seed.use = 12345, 
+                     reduction = "SCVI", n.components = 3)
+DimPlot(integrated, label = TRUE, reduction = "umap", group.by = "orig.ident", pt.size = 0.1) +
+  scale_color_npg()
+```   
+   
+### Get cluster markers   
+```{r eval=FALSE}
+initial_markers = FindAllMarkers(integrated, random.seed = 12345)
+
+#using initial_markers from above
+initial_markers = initial_markers %>% 
+  arrange(cluster, desc(avg_log2FC))
+write_csv(initial_markers, "/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/analysis/230110_initial_markers.csv")
+
+initial_markers
+```   
+   
+Annotated separately by hand   
+   
+## Remove damaged cells   
+### Cluster characteristics   
+```{r}
+VlnPlot(integrated, "nCount_RNA", log = T, pt.size = 0)
+VlnPlot(integrated, "nFeature_RNA", log = T, pt.size = 0)
+VlnPlot(integrated, "pct_mito", pt.size = 0)
+DimPlot(integrated, label = TRUE, reduction = "umap", pt.size = 0.1) 
+```   
+   
+### Doublet scores   
+```{r}
+dub_files = list.files("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/scrublet",
+                       pattern = "_doublets.csv",
+                       full.names = T)
+names(dub_files) = basename(dub_files) %>% 
+  substring(1, 5)
+
+doublet_scores = lapply(dub_files, function(file){
+  sample = gsub("_doublets.csv", "", basename(file))
+  df = read.csv(file) %>% 
+    dplyr::select(barcode = X0, doublet_score = doublet) %>% 
+    dplyr::mutate(barcode = paste(sample, barcode, sep = "_"))
+  return(df) }) %>% 
+  bind_rows()
+
+
+integrated = integrated %>% 
+  mutate(barcode = colnames(.)) %>% 
+  left_join(., doublet_scores) %>% 
+  dplyr::select(-barcode)
+
+integrated %>%
+  ggplot(aes(x = seurat_clusters, y = doublet_score)) +
+  geom_boxplot()
+```
+
+   
+1, 2, 5, and 6 look low-quality. No obvious doublets.      
+   
+### Perform filtering   
+```{r}
+integrated = integrated %>% 
+  tidyseurat::filter(!(seurat_clusters %in% c(1, 2, 5, 6)))
+```
+   
+# Re-run integration   
+## Export object   
+```{r eval=FALSE}
+saveRDS(integrated, "/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/analysis/230111_human_microglia_SCVI_integrated_cleaned.rds")
+```   
+   
+## Run integration script   
+~/aging_microglia_flu/230111_human_microglia_flu_SCVI_integration.sh   
+   
+# Final version (start here)     
+## Import   
+```{r}
+final = readRDS("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/analysis/230111_human_microglia_SCVI_integrated_final.rds")
+ 
+final = FindNeighbors(final, dims = 1:10, verbose = FALSE, reduction = "SCVI")
+final = FindClusters(final, verbose = FALSE, random.seed = 12345, method = 4)
+final = RunUMAP(final, dims = 1:10, verbose = FALSE, seed.use = 12345, 
+                     reduction = "SCVI", n.components = 3)
+DimPlot(final, label = TRUE, reduction = "umap", group.by = "orig.ident", pt.size = 0.1) +
+  scale_color_npg()
+```
+   
+## Summary metrics   
+### Cluster quality
+```{r}
+VlnPlot(final, "nCount_RNA", log = T, pt.size = 0)
+VlnPlot(final, "nFeature_RNA", log = T, pt.size = 0)
+ggplot(final, aes(x = seurat_clusters, y = pct_mito, fill = seurat_clusters)) +
+  geom_boxplot() +
+  theme_bw(base_family = "Arial")
+```
+   
+### Plot cluster composition   
+By donor   
+```{r}
+barplot_mixture = final %>% tidyseurat::ggplot(aes(x = seurat_clusters, fill = sample)) +
+  geom_bar(position = "fill") +
+  theme_bw(base_family = "Arial") +
+  scale_fill_npg()
+barplot_mixture
+
+cluster_plot = DimPlot(final, 
+                       pt.size = 0.1, 
+                       raster = F, 
+                       label = T, 
+                       label.box = T,
+                       group.by = "seurat_clusters",
+                       label.size = 6) +
+  scale_fill_manual(name = "",
+                     values = rep(alpha("white", 0.5), 21)) +
+  NoLegend() +
+  scale_color_manual(values = nature_pal_20)
+cluster_plot
+
+DimPlot(final, dims = c(2,3), label = T) + NoLegend()
+
+final %>%
+  tidyseurat::plot_ly(x = ~`UMAP_1`, y = ~`UMAP_2`, z = ~`UMAP_3`,
+                      size = 0.1, 
+                      type = "scatter3d",
+                      color = ~seurat_clusters)
+```   
+   
+```{r}
+CairoPDF("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/230112_mixture_barplot.pdf",
+    width = 12,
+    height = 9, 
+    family = "Arial")
+barplot_mixture
+dev.off()
+CairoPNG("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/230112_mixture_barplot.png",
+    width = 12,
+    height = 9, 
+    units = "in",
+    res = 300,
+    family = "Arial")
+barplot_mixture
+dev.off()
+
+CairoPDF("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/230112_clusterplot.pdf",
+    width = 12,
+    height = 9, 
+    family = "Arial")
+cluster_plot
+dev.off()
+CairoPNG("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/230112_clusterplot.png",
+    width = 12,
+    height = 9, 
+    units = "in",
+    res = 300,
+    family = "Arial")
+cluster_plot
+dev.off()
+```
+
+Good mixing all around.         
+   
+By COVID status   
+```{r}
+final = final %>% 
+  tidyseurat::mutate(main_group = factor(case_when(grepl("COVID", group) ~ "COVID-19",
+                                                   group == "Control" ~ "Control"),
+                                         levels = c("COVID-19", "Control")))
+total_covid_percentage = sum(final$main_group == "COVID-19") / ncol(final)
+
+covid_barplot = final %>% tidyseurat::ggplot(aes(x = seurat_clusters, fill = main_group)) +
+  geom_bar(position = "fill") +
+  theme_bw(base_family = "Arial") +
+  scale_fill_npg() +
+  labs(x = "", y = "Proportion of Cells", fill = "Group") +
+  geom_hline(yintercept = (1-total_covid_percentage), linetype = 2)
+covid_barplot
+
+DimPlot(final, group.by = "group", pt.size = 0.1) +
+  scale_color_npg()
+```
+   
+```{r}
+CairoPDF("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/230112_COVID_barplot.pdf",
+    width = 8,
+    height = 6, 
+    family = "Arial")
+covid_barplot
+dev.off()
+CairoPNG("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/230112_COVID_barplot.png",
+    width = 8,
+    height = 6, 
+    units = "in",
+    res = 300,
+    family = "Arial")
+covid_barplot
+dev.off()
+```
+   
+### Get cluster markers   
+```{r eval=FALSE}
+final_markers = FindAllMarkers(final, random.seed = 12345)
+final_markers = final_markers %>% 
+  arrange(cluster, desc(avg_log2FC))
+write_csv(final_markers, "/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/analysis/230118_human_final_markers.csv")
+```   
+      
+### Rough cluster identity   
+```{r}
+classical_markers = c("GRCh38-TMEM119", "GRCh38-P2RY12", "GRCh38-AIF1", 
+                      "GRCh38-APOE", "GRCh38-SPP1", "GRCh38-B2M",
+                      "GRCh38-CD3E", "GRCh38-CD8A", "GRCh38-CD69",
+                      "GRCh38-PTPRC", "GRCh38-HLA-A",
+                      "GRCh38-S100A4", "GRCh38-S100A6", "GRCh38-CD14",
+                      "GRCh38-CD19", "GRCh38-JCHAIN",
+                      "GRCh38-MKI67")
+marker_vlnplot = VlnPlot(final, features = classical_markers, pt.size = 0.1)
+marker_vlnplot
+```   
+   
+### Get "local" markers of microglia and lymphocytes   
+```{r eval=FALSE}
+microglia = final %>% 
+  tidyseurat::filter(seurat_clusters %in% c(0:6, 8, 9, 11, 14, 15))
+microglia_markers = FindAllMarkers(microglia, random.seed = 12345) %>% 
+  arrange(cluster, desc(avg_log2FC))
+write_csv(microglia_markers, "/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/analysis/220118_microglia_markers.csv")
+rm(microglia)
+
+lymphocytes = final %>% 
+  tidyseurat::filter(seurat_clusters %in% c(7, 12, 13))
+lymphocyte_markers = FindAllMarkers(lymphocytes, random.seed = 12345) %>% 
+  arrange(cluster, desc(avg_log2FC))
+write_csv(lymphocyte_markers, "/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/analysis/220118_lymphocyte_markers.csv")
+rm(lymphocytes)
+gc()
+```
+   
+### Differentiate T cell subsets   
+   
+See https://atlas.fredhutch.org/nygc/multimodal-pbmc/ 
+   
+### Annotate cell types   
+```{r}
+annotations = read_csv("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/analysis/230210_SCVI_integrated_cleaned_cluster_assignments.csv",
+                       na = "NA") %>% 
+  dplyr::filter(!is.na(cluster)) %>% 
+  dplyr::select(-comments) %>% 
+  mutate(cluster = as.factor(cluster),
+         combined = factor(gsub(", $", "", paste(celltype, subtype, sep = ", "))))
+final = final %>% 
+  left_join(., annotations, by = c("seurat_clusters" = "cluster"))
+
+typestate_umap = DimPlot(final, 
+                         group.by = "combined", 
+                         label = T, 
+                         label.box = T, 
+                         repel = T, 
+                         combine = T,
+                         seed = 12345,
+                         label.size = 4,
+                         pt.size = 0.1) + 
+  NoLegend() +
+  labs(x = "UMAP 1", y = "UMAP 2", title = "") +
+  scale_color_manual(values = nature_pal_long)
+  
+typestate_umap
+
+final %>%
+  tidyseurat::plot_ly(x = ~`UMAP_1`, y = ~`UMAP_2`, z = ~`UMAP_3`,
+                      size = 0.01, 
+                      type = "scatter3d",
+                      alpha = 0.7,
+                      color = ~combined)
+```   
+   
+### Cell-type UMAP   
+```{r}
+CairoPDF("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220607_integrated_celltype_UMAP.pdf",
+    width = 12,
+    height = 12, 
+    family = "Arial")
+typestate_umap
+dev.off()
+
+CairoPNG("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220607_integrated_celltype_UMAP.png",
+    width = 12,
+    height = 10, 
+    units = "in",
+    res = 300,
+    family = "Arial")
+typestate_umap
+dev.off()
+
+#ditto version:
+dittversion = dittoDimPlot(final, var = "combined", dim.1 = "UMAP_1", dim.2 = "UMAP_2", do.label = T, 
+                              opacity = 0.7, labels.repel = T, do.raster = T, raster.dpi = 300) +
+  labs(x = "UMAP 1", y = "UMAP 2", title = "") +
+  scale_color_manual(values = nature_pal_long) +
+  theme(legend.position = "none")
+
+CairoPDF("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220905_integrated_celltype_UMAP.pdf",
+    width = 12,
+    height = 9, 
+    family = "Arial")
+dittversion
+dev.off()
+
+dittversion
+```   
+   
+### Plot marker heatmap   
+Automated   
+```{r}
+Idents(final) = final$combined
+
+# Identify top 10 markers per cluster
+markers = final %>%
+  FindAllMarkers(only.pos = TRUE, random.seed = 12345) %>%
+  group_by(cluster) %>%
+  top_n(5, abs(avg_log2FC)) %>% 
+  dplyr::filter(!grepl("-RP[LS]|-MT-|-EEF|-SH3", gene) & !(gene %in% c("GRCh38-MALAT1"))) %>% 
+  .$gene %>% 
+  #union(., classical_markers) %>% 
+  unique()
+  
+
+# Plot heatmap
+#manual
+# feature_heatmap = final %>%
+#   DoHeatmap(features = markers, assay = "SCT", slot = "scale.data")
+# 
+# hm_data = feature_heatmap$data
+# hm_mat = hm_data %>% 
+#   dplyr::arrange(Identity) %>% 
+#   dplyr::select(-Identity) %>% 
+#   dplyr::mutate(Feature = gsub("GRCh38-", "", Feature)) %>% 
+#   pivot_wider(names_from = Cell, values_from = Expression) %>% 
+#   column_to_rownames("Feature") %>% 
+#   data.matrix()
+# hm_md = hm_data %>% 
+#   dplyr::arrange(Identity) %>% 
+#   dplyr::select(Cell, Identity) %>% 
+#   unique() %>% 
+#   remove_rownames() %>% 
+#   column_to_rownames("Cell")
+# 
+# all(rownames(hm_md) == colnames(hm_mat))
+# 
+# feature_heatmap = pheatmap(hm_mat,
+#         clustering_method = "ward.D2",
+#         cluster_cols = F,
+#         clustering_distance_rows = "euclidean",
+#         show_colnames = F,
+#         show_rownames = T,
+#         breaks = seq(-1, 3, length.out=101),
+#         color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(101),
+#         annotation_col = hm_md)
+# 
+# feature_heatmap
+
+# dittoseq
+col_fun = colorRamp2(c(-2, 0, 2), rev(brewer.pal(7, "RdBu")[c(1,4,7)]))
+final$Group = factor(as.character(final$main_group)) #refactor to remove unused
+gene_names = gsub("GRCh38-", "", markers)
+marker_hm = dittoHeatmap(object = final, 
+                         genes = markers, 
+                         order.by = "combined",
+                         annot.by = c("combined", "Group"), 
+                         scaled.to.max = F,
+                         scale = "row",
+                         heatmap.colors = col_fun,
+                         legend_breaks = c(-2:2),
+                         na_col = "#000000",
+                         annot.colors = nature_pal_long, 
+                         #clustering_method_rows = "ward.D2",
+                         complex = T,
+                         drop_levels = T,
+                         labels_row = gene_names,
+                         annotation_colors = list("Group" = c("COVID-19" = nature_pal[8],
+                                                            "Control" = nature_pal[3])),
+                         use_raster = TRUE, 
+                         raster_quality = 5)
+
+```   
+   
+Binned by subject   
+```{r}
+curated_markers = markers %>% 
+  c(., 
+    "GRCh38-AIF1", "GRCh38-TMEM119", "GRCh38-P2RY12", 
+    "GRCh38-CD3E", "GRCh38-CD8A", 
+    "GRCh38-CD19", "GRCh38-JCHAIN",
+    "GRCh38-CDKN1A") %>% 
+  setdiff(., 
+          c("GRCh38-NEAT1", "GRCh38-AHNAK", "GRCh38-SNHG29", "GRCh38-ITM2B",
+          "GRCh38-HMGN2", "GRCh38-ARL6IP1", "GRCh38-SYNE2", "GRCh38-APOC2"))
+
+binned_markers_long = final %>% 
+  join_features(features = curated_markers) %>% 
+  group_by(sample, .feature, main_group, combined, celltype) %>% 
+  dplyr::summarize(mean_expression = mean(.abundance_SCT, na.rm = T),
+                   n_cells = n()) %>% 
+  dplyr::mutate(unique_id = paste(combined, sample),
+                Gene = gsub("GRCh38-", "", .feature)) %>% 
+  dplyr::select(-.feature) %>% 
+  ungroup() %>% 
+  #avoid bias associated with just a few cells in a given grouping
+  dplyr::filter(n_cells >= 50) %>% 
+  arrange(celltype, combined, main_group, sample)
+
+binned_markers_mat = binned_markers_long %>% 
+  pivot_wider(names_from = Gene,
+              values_from = mean_expression,
+              id_cols = unique_id) %>% 
+  column_to_rownames("unique_id") %>% 
+  data.matrix() %>% 
+  scale() %>% 
+  t() 
+
+#set up annotations                    
+binned_markers_md = binned_markers_long %>% 
+  dplyr::select(unique_id, Group = main_group, 
+                Patient = sample, Celltype = combined) %>% 
+  unique() %>% 
+  column_to_rownames("unique_id")
+all(colnames(binned_markers_mat) == rownames(binned_markers_md)) #true
+
+celltype_colors = nature_pal_long[1:length(unique(binned_markers_md$Celltype))]
+names(celltype_colors) = unique(binned_markers_md$Celltype)
+sample_colors = simpsons_pal[1:length(unique(binned_markers_md$Patient))]
+names(sample_colors) = unique(binned_markers_md$Patient)
+cluster_colors = futurama_pal[1:19]
+names(cluster_colors) = unique(binned_markers_md$Cluster)
+
+ha = HeatmapAnnotation(df = binned_markers_md,
+                       col = list(Group = c("COVID-19" = nature_pal[1],
+                                            "Control" = nature_pal[2]),
+                                  Patient = sample_colors,
+                                  Celltype = celltype_colors))
+
+col_fun = colorRamp2(c(-3, 0, 3), c("blue", "white", "red"))
+
+binned_marker_hm = Heatmap(matrix = binned_markers_mat,
+                            cluster_rows = T,
+                            cluster_columns = F,
+                            show_column_names = F,
+                           column_split = binned_markers_md$Celltype,
+                           column_title_rot = 90,
+                           column_title_gp = gpar(fontsize = 10),
+                            clustering_method_rows = "ward.D2",
+                           top_annotation = ha,
+                           col = col_fun)
+binned_marker_hm
+```   
+   
+   
+Binned by major group   
+```{r}
+curated_markers = markers %>% 
+  c(., 
+    "GRCh38-AIF1", "GRCh38-TMEM119", "GRCh38-P2RY12", 
+    "GRCh38-CD3E", "GRCh38-CD8A", 
+    "GRCh38-CD19", "GRCh38-JCHAIN",
+    "GRCh38-CDKN1A", "GRCh38-TOP2A",
+    "GRCh38-APOC1", "GRCh38-LPL") %>% 
+  setdiff(., 
+          c("GRCh38-NEAT1", "GRCh38-AHNAK", "GRCh38-SNHG29", "GRCh38-ITM2B",
+          "GRCh38-HMGN2", "GRCh38-ARL6IP1", "GRCh38-SYNE2"))
+
+binned_markers_long = final %>% 
+  join_features(features = curated_markers) %>% 
+  group_by(.feature, main_group, combined, celltype) %>% 
+  dplyr::summarize(mean_expression = mean(.abundance_SCT, na.rm = T),
+                   n_cells = n()) %>% 
+  dplyr::mutate(unique_id = paste(combined, main_group),
+                Gene = gsub("GRCh38-", "", .feature)) %>% 
+  dplyr::select(-.feature) %>% 
+  ungroup() %>% 
+  #avoid bias associated with just a few cells in a given grouping
+  dplyr::filter(n_cells >= 50) %>% 
+  arrange(celltype, combined, main_group)
+
+binned_markers_mat = binned_markers_long %>% 
+  pivot_wider(names_from = Gene,
+              values_from = mean_expression,
+              id_cols = unique_id) %>% 
+  column_to_rownames("unique_id") %>% 
+  data.matrix() %>% 
+  scale() %>% 
+  t() 
+
+#set up annotations                    
+binned_markers_complete = binned_markers_long %>% 
+  dplyr::select(unique_id, Group = main_group, 
+                Celltype = combined) %>% 
+  unique() %>% 
+  column_to_rownames("unique_id")
+binned_markers_md = binned_markers_complete %>% 
+  dplyr::select(-Celltype)
+all(colnames(binned_markers_mat) == rownames(binned_markers_md)) #true
+
+celltype_colors = nature_pal_long[1:length(unique(binned_markers_md$Celltype))]
+names(celltype_colors) = unique(binned_markers_md$Celltype)
+sample_colors = simpsons_pal[1:length(unique(binned_markers_md$Patient))]
+names(sample_colors) = unique(binned_markers_md$Patient)
+cluster_colors = futurama_pal[1:19]
+names(cluster_colors) = unique(binned_markers_md$Cluster)
+
+ha = HeatmapAnnotation(df = binned_markers_md,
+                       col = list(Group = c("COVID-19" = nature_pal[1],
+                                            "Control" = nature_pal[2]),
+                                  Celltype = celltype_colors),
+                       simple_anno_size = unit(1, "cm"), 
+                       annotation_name_gp =  gpar(fontsize = 30),
+                       annotation_legend_param = list(title_gp = gpar(fontsize = 30),
+                                                      labels_gp = gpar(fontsize = 24),
+                                                      legend_gp = gpar(fontsize = 24),
+                                                      grid_height = unit(1, "cm"), 
+                                                      grid_width = unit(1, "cm")))
+
+col_fun = colorRamp2(c(-3, 0, 3), c("blue", "white", "red"))
+
+binned_marker_hm = Heatmap(matrix = binned_markers_mat,
+                            cluster_rows = T,
+                            cluster_columns = F,
+                            show_column_names = F,
+                           column_split = binned_markers_complete$Celltype,
+                           column_title_rot = 70,
+                           row_names_gp = gpar(fontsize = 18, fontface = "bold.italic"),
+                           column_title_gp = gpar(fontsize = 30),
+                            clustering_method_rows = "ward.D2",
+                           top_annotation = ha,
+                           col = col_fun,  
+                           heatmap_legend_param = list(title = "z-Normalized\nExpression",
+                                                       direction = "horizontal",
+                                                       title_position = "topcenter",
+                                                       title_gp = gpar(fontsize = 30),
+                                                       labels_gp = gpar(fontsize = 24),
+                                                       legend_width = unit(6, "cm"),
+                                                       legend_height = unit(2, "cm")))
+
+draw(binned_marker_hm, annotation_legend_side = "bottom", 
+     heatmap_legend_side = "bottom",
+     merge_legend = TRUE)
+```   
+   
+```{r}
+CairoPDF("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220607_binned_marker_heatmap.pdf",
+    width = 12,
+    height = 12, 
+    family = "Arial")
+binned_marker_hm
+dev.off()
+CairoPNG("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220607_binned_marker_heatmap.png",
+    width = 12,
+    height = 12, 
+    units = "in",
+    res = 300,
+    family = "Arial")
+binned_marker_hm
+dev.off()
+```
+      
+## DAM enrichment   
+### Make gene module   
+   
+Using Keren-Schaul et al., Cell, 2017; supplemental table S3   
+   
+```{r warning=FALSE}
+dam_genes = read_excel("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/analysis/1-s2.0-S0092867417305780-mmc3-1.xlsx",
+                       skip = 1,
+                       col_names = c("external_gene_name",
+                                     "UMI_per_cell_homeostatic",
+                                     "Log2FC_DAM_over_homeostatic",
+                                     "P_p",
+                                     "P_fdr"), 
+                       col_types = c("text",
+                                     "numeric",
+                                     "numeric",
+                                     "numeric",
+                                     "numeric")) %>% 
+  #calculated their FDR values wrong? ~Double what I'm seeing, but tightly correlated
+  dplyr::mutate(pval = 10 ^ -P_p,
+                fdr_original = 10 ^ -P_fdr,
+                padj = p.adjust(pval, method = "fdr"),
+                UMI_DAM = UMI_per_cell_homeostatic * 2 ^ Log2FC_DAM_over_homeostatic) %>% 
+  #only want positive hits for this purpose, and pick genes with reasonable expression
+  dplyr::filter(padj < 0.05 & 
+                  Log2FC_DAM_over_homeostatic > 0 & 
+                  UMI_DAM >= 0.5 & 
+                  !grepl("^Rpl|^Rps|^Mt-", external_gene_name))
+
+#get human orthologs   
+mouse_mart = useMart("ensembl", "mmusculus_gene_ensembl")
+human_orthologs = getBM(attributes = c("ensembl_gene_id", 
+                                       "external_gene_name",
+                                       "hsapiens_homolog_associated_gene_name"),
+                  mart = mouse_mart)
+
+dam_genes = left_join(dam_genes, human_orthologs) %>% 
+  dplyr::filter(!is.na(hsapiens_homolog_associated_gene_name) &
+                  hsapiens_homolog_associated_gene_name != "") %>% 
+  dplyr::mutate(merge_symbol = paste0("GRCh38-", 
+                                      hsapiens_homolog_associated_gene_name)) %>% 
+  dplyr::filter(merge_symbol %in% rownames(final))
+
+nrow(dam_genes) #111
+
+final = AddModuleScore(final, 
+                            features = list("DAM" = dam_genes$merge_symbol),
+                            seed = 12345,
+                            name = "DAM_Score")
+```   
+   
+### Cluster expression   
+```{r}
+DAM_celltype_plot = final %>% 
+  dplyr::filter(celltype == "Microglia") %>% 
+  tidyseurat::ggplot(aes(y = DAM_Score1, 
+                         x = reorder(seurat_clusters, -DAM_Score1), 
+                         fill = seurat_clusters)) +
+  geom_boxplot() +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust=1)) +
+  scale_fill_npg() +
+  labs(x = "", y = "DAM Module Expression", title = "")
+DAM_celltype_plot
+
+DAM_featureplot = FeaturePlot(final, features = "DAM_Score1", order = T, label = T) +
+  labs(title = "DAM Module Expression")
+DAM_featureplot
+```
+   
+```{r}
+CairoPDF("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220607_DAM_boxplot_typestate.pdf",
+    width = 6,
+    height = 5, 
+    family = "Arial")
+DAM_celltype_plot
+dev.off()
+CairoPNG("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220607_DAM_boxplot_typestate.png",
+    width = 6,
+    height = 5, 
+    units = "in",
+    res = 300,
+    family = "Arial")
+DAM_celltype_plot
+dev.off()
+
+CairoPDF("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220607_DAM_featureplot.pdf",
+    width = 10,
+    height = 7, 
+    family = "Arial")
+DAM_featureplot
+dev.off()
+CairoPNG("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220607_DAM_featureplot.png",
+    width = 10,
+    height = 7, 
+    units = "in",
+    res = 300,
+    family = "Arial")
+DAM_featureplot
+dev.off()
+```   
+   
+This captures the DAM state relatively well.   
+   
+### COVID vs non      
+```{r}
+dam_data = final %>% 
+  dplyr::select(DAM_Score1, main_group, combined, sample)
+
+dam_sum = dam_data %>% 
+  group_by(main_group, combined, sample) %>% 
+  dplyr::summarize(across(.cols = , .fns = list(mean = mean, median = median, sd = sd), .names = "{.fn}__{.col}"))
+
+DAM_group_plot = ggplot(dam_sum, aes(y = median__DAM_Score1, x = combined, fill = main_group)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.3, seed = 12345), size = 0.7) +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 45, hjust=1),
+        plot.margin = margin(10, 10, 10, 100)) +
+  scale_fill_npg(name = "") +
+  labs(x = "", y = "DAM Module Expression", title = "")
+DAM_group_plot
+```   
+   
+No real difference.   
+   
+```{r}
+CairoPDF("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220607_DAM_boxplot_group.pdf",
+    width = 9,
+    height = 6, 
+    family = "Arial")
+DAM_group_plot
+dev.off()
+CairoPNG("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220607_DAM_boxplot_group.png",
+    width = 9,
+    height = 6, 
+    units = "in",
+    res = 300,
+    family = "Arial")
+DAM_group_plot
+dev.off()
+```
+      
+## Differential abundance analysis   
+### Simple test of proportions      
+```{r}
+covid_enrichment = vector(mode = "list", length = length(unique(final$combined)))
+for(i in 1:length(unique(final$combined)))
+{
+  cluster = unique(final$combined)[i]
+  
+  #make contingency table
+  contingency = final %>% 
+    group_by(main_group) %>% 
+    dplyr::summarize(in_cluster = sum(combined == cluster),
+                     not_in_cluster = sum(combined != cluster)) %>% 
+    column_to_rownames("main_group") %>% 
+    data.matrix() %>% 
+    t() 
+  
+  #perform test of proportions (chisq)
+  test = prop.test(contingency)
+  
+  #summarize results
+  out = data.frame(combined = as.character(cluster),
+                   pval = test$p.value,
+                   percent_covid_cluster = as.numeric(test$estimate[1]),
+                   percent_covid_total = as.numeric(test$estimate[2]))
+  covid_enrichment[[i]] = out
+}
+covid_enrichment = bind_rows(covid_enrichment) %>% 
+  dplyr::mutate(padj = p.adjust(pval, method = "fdr"),
+                enrichment = factor(case_when(padj < 0.05 & 
+                                                percent_covid_cluster > percent_covid_total ~ "COVID-19",
+                                       padj < 0.05 & 
+                                         percent_covid_cluster < percent_covid_total ~ "Control",
+                                       padj >= 0.05 ~ "No Enrichment"))) %>% 
+  arrange(combined)
+covid_enriched_clusters = covid_enrichment %>% 
+  dplyr::filter(enrichment == "COVID-19") %>% 
+  .$combined
+covid_enriched_clusters
+```   
+   
+### GLM-based   
+   
+Based on https://www.nxn.se/valent/2020/11/28/s9jjv32ogiplagwx8xrkjk532p7k28   
+   
+```{r}
+abundances = final %>% 
+  group_by(combined) %>% 
+  dplyr::mutate(total_cells = n()) %>% 
+  group_by(group, sample, combined, total_cells) %>% 
+  dplyr::summarize(in_cluster = n(),
+                   out_of_cluster = total_cells - in_cluster) %>% 
+  unique()
+
+model = glm(formula = cbind(in_cluster, out_of_cluster) ~ combined * group,
+            family = binomial(link = 'logit'),
+            data = abundances)
+
+enrichment = emmeans(model, specs = pairwise ~ group | combined) %>% 
+  .$contrasts %>% 
+  summary(infer = TRUE, type = 'response') %>%
+  bind_rows() 
+
+mean_probs = emmeans(model, specs = ~ combined) %>% 
+  summary(type = 'response') %>%
+  dplyr::select(combined, prob)
+
+plot_data = left_join(enrichment, mean_probs) %>% 
+  dplyr::mutate(padj = p.adjust(p.value, method = "fdr"),
+                                significant = factor(padj < 0.05 & odds.ratio < 1,
+                                     levels = c("TRUE", "FALSE")))
+
+svensson_enrichment = ggplot(plot_data, aes(x = prob, y = odds.ratio, color = significant)) +
+  scale_color_npg(name = "Significantly Enriched") +
+  theme_bw() +
+  geom_point(size = 3) +
+  geom_text_repel(aes(label = combined), color = "black") +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(x = "Average Proportion of Cells in Cluster",
+       y = "Odds Ratio, COVID-19 / Control")
+svensson_enrichment
+```   
+   
+```{r}
+CairoPDF("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220607_svensson_plot.pdf",
+    width = 10,
+    height = 6, 
+    family = "Arial")
+svensson_enrichment
+dev.off()
+
+CairoPNG("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220607_svensson_plot.png",
+    width = 10,
+    height = 6, 
+    res = 300,
+    units = "in",
+    family = "Arial")
+svensson_enrichment
+dev.off()
+```
+   
+### Percentage of parent cell type, all cells         
+```{r}
+celltype_counts = final %>% 
+  group_by(sample, celltype, main_group) %>% 
+  dplyr::summarize(celltype_count = n())
+
+cluster_count_sum = final %>% 
+  group_by(combined, celltype, sample, .drop = F) %>% 
+  dplyr::summarize(cluster_cells = n()) %>% 
+  left_join(., celltype_counts) %>% 
+  dplyr::mutate(percent = cluster_cells / celltype_count * 100) %>% 
+  dplyr::filter(!is.na(main_group))
+
+percent_comps = cluster_count_sum %>% 
+  group_by(combined) %>% 
+  dplyr::summarize(pval_wilcox = wilcox.test(percent ~ main_group)$p.value) %>% 
+  dplyr::mutate(padj = p.adjust(pval_wilcox, method = "fdr"))
+
+cluster_percentages = ggplot(cluster_count_sum, aes(x = main_group, y = percent, fill = main_group)) +
+  facet_wrap(~ combined, scales = "free_y") +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(position = position_jitterdodge(seed = 12345)) +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(size = 24),
+        axis.text.y = element_text(size = 24),
+        axis.title.x = element_text(size = 36),
+        axis.title.y = element_text(size = 36),
+         strip.text = element_text(size = 24)) +
+  scale_fill_npg(name = "Group") +
+  labs(x = "Cluster", y = "Percentage of Parent Cluster")
+
+#plot with sample names overlaid
+ ggplot(cluster_count_sum, aes(x = main_group, y = percent, fill = main_group)) +
+  facet_wrap(~ combined, scales = "free_y") +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(position = position_jitterdodge(seed = 12345)) +
+  geom_label_repel(aes(label = sample)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust=1),
+        legend.position = "none") +
+  scale_fill_npg(name = "Group") +
+  labs(x = "Cluster", y = "Percentage of Parent Cluster")
+
+cluster_percentages
+```
+   
+### Percentage of parent cell type, just microglia         
+```{r}
+cluster_count_sum = cluster_count_sum %>% 
+  dplyr::filter(celltype == "Microglia")
+
+percent_comps = cluster_count_sum %>% 
+  group_by(combined, .drop = T) %>% 
+  dplyr::summarize(pval_wilcox = wilcox.test(percent ~ main_group)$p.value) %>% 
+  dplyr::mutate(padj = p.adjust(pval_wilcox, method = "fdr"))
+
+cluster_percentages = ggplot(cluster_count_sum, aes(x = main_group, y = percent, fill = main_group)) +
+  facet_wrap(~ combined, scales = "free_y", ncol = 2) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(position = position_jitterdodge(seed = 12345)) +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(size = 24),
+        axis.text.y = element_text(size = 24),
+        axis.title.x = element_text(size = 36),
+        axis.title.y = element_text(size = 36),
+         strip.text = element_text(size = 24)) +
+  scale_fill_npg(name = "Group") +
+  labs(x = "", y = "Percent of Total Microglia")
+cluster_percentages
+```
+   
+```{r}
+CairoPDF("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/230119_cluster_percentages.pdf",
+    width = 8,
+    height = 12, 
+    family = "Arial")
+cluster_percentages
+dev.off()
+
+CairoPNG("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/230119_cluster_percentages.png",
+    width = 8,
+    height = 12, 
+    res = 300,
+    units = "in",
+    family = "Arial")
+cluster_percentages
+dev.off()
+```
+   
+## scCoda   
+### Arrange data   
+```{r}
+covid_sum = final %>% 
+  group_by(main_group, sample, combined) %>% 
+  dplyr::summarize(n_cells = n()) %>% 
+  ungroup() %>% 
+  as.data.frame()
+
+#make matrix of celltype counts
+cell_count_mat = covid_sum %>% 
+  pivot_wider(id_cols = c(sample, main_group), names_from = combined, values_from = n_cells, values_fill = 0) %>% 
+  dplyr::mutate(across(.cols = `B Cells`:`Monocytes, Homeostatic`, .fns = as.double)) %>% 
+  as.data.frame()
+colnames(cell_count_mat) = gsub(", |\\+|-| ", "_", colnames(cell_count_mat))
+
+#pass to python
+py$cell_count_mat = cell_count_mat
+```
+   
+### Transfer data to python 
+```{python}
+import pandas as pd
+import pickle as pkl
+import arviz as az
+import matplotlib.pyplot as plt
+from sccoda.util import comp_ana as mod
+from sccoda.util import cell_composition_data as dat
+from sccoda.util import data_visualization as viz
+
+# Convert data to anndata object
+cell_count_mat = dat.from_pandas(r.cell_count_mat, covariate_columns=["sample", "main_group"])
+
+viz.boxplots(cell_count_mat, feature_name="main_group")
+plt.show()
+```   
+   
+### Model abundance   
+```{python eval=FALSE}
+scCoda_model = mod.CompositionalAnalysis(cell_count_mat, formula="main_group", reference_cell_type="Microglia_Homeostatic")
+# Run MCMC
+sim_results = scCoda_model.sample_hmc()
+sim_results.summary()
+```   
+   
+Nothing significant.   
+   
+# DEA   
+## Pseudobulk   
+### By cluster   
+```{r eval=FALSE}
+bulk_md = final %>% 
+  dplyr::select(sample, main_group) %>% 
+  unique() %>% 
+  column_to_rownames("sample")
+
+cell_IDs = final %>% 
+  dplyr::select(sample) %>% 
+  as.data.frame()
+rownames(cell_IDs) = colnames(final)
+
+bulkDEA(object = final,
+        metaData = bulk_md,
+        design = formula("~ main_group"),
+        splitCells = T,
+        cellFactor = "combined",
+        organism = "hsapiens",
+        geneVar = "external_gene_name",
+        outDir = "/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/230120_pseudobulk_analysis/",
+        outPrefix = "pseudobulk_seuratClusters",
+        minCells = 50,
+        cores = 4,
+        fit_type = "local",
+        genomePrefix = "GRCh38-",
+        cellMappings = cell_IDs)
+gc()  
+```   
+   
+### By cell type/state   
+```{r eval=FALSE}
+bulk_md = final %>% 
+  dplyr::select(sample, main_group) %>% 
+  unique() %>% 
+  column_to_rownames("sample")
+
+cell_IDs = final %>% 
+  dplyr::select(sample) %>% 
+  as.data.frame()
+rownames(cell_IDs) = colnames(final)
+
+bulkDEA(object = final,
+        metaData = bulk_md,
+        design = formula("~ main_group"),
+        splitCells = T,
+        cellFactor = "combined",
+        organism = "hsapiens",
+        geneVar = "external_gene_name",
+        outDir = "/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/230120_pseudobulk_analysis/",
+        outPrefix = "pseudobulk_typestate",
+        minCells = 50,
+        cores = 4,
+        fit_type = "local",
+        genomePrefix = "GRCh38-",
+        cellMappings = cell_IDs)
+gc()  
+```   
+   
+### By celltype alone   
+```{r eval=FALSE}
+bulk_md = final %>% 
+  dplyr::select(sample, main_group) %>% 
+  unique() %>% 
+  column_to_rownames("sample")
+
+cell_IDs = final %>% 
+  dplyr::select(sample) %>% 
+  as.data.frame()
+rownames(cell_IDs) = colnames(final)
+
+bulkDEA(object = final,
+        metaData = bulk_md,
+        design = formula("~ main_group"),
+        splitCells = T,
+        cellFactor = "celltype",
+        organism = "hsapiens",
+        geneVar = "external_gene_name",
+        outDir = "/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/230119_pseudobulk_analysis/",
+        outPrefix = "pseudobulk_celltype",
+        minCells = 50,
+        cores = 4,
+        fit_type = "local",
+        genomePrefix = "GRCh38-",
+        cellMappings = cell_IDs)
+gc()        
+```  
+
+      
+## Summarize hits   
+### Raw number of hits      
+```{r}
+summarize_hits = function(files, prefix){
+  #get names of compared groups
+  comps = files %>% 
+    basename() %>% 
+    gsub(pattern = prefix, replacement = "", .) %>% 
+    substring(1, regexpr("\\_subset", .) - 1)
+  
+  #prepare to create long-form summary of upregulated and downregulated hits
+  main_group = rep(comps, each = 2)
+  direction = rep(c("Upregulated", "Downregulated"), length(comps))
+  
+  #now iterate through hits files, count up and downregulated genes
+  n_hits = vector(mode = "numeric", length = length(main_group))
+  for(i in 1:length(files))
+  {
+    hits = read.csv(files[i]) %>% 
+      dplyr::filter(padj < 0.05)
+    
+    upregulated = hits %>% 
+      dplyr::filter(log2FoldChange > 0) %>% 
+      .$external_gene_name %>% 
+      unique()
+    downregulated = hits %>% 
+      dplyr::filter(log2FoldChange < 0) %>% 
+      .$external_gene_name %>% 
+      unique()
+    
+    #now fill in in order up, down
+    start = 1 + 2 * (i - 1)
+    n_hits[start] = length(upregulated)
+    n_hits[start + 1] = length(downregulated)
+  }
+  
+  #tidy into dataframe and return
+  df = data.frame(main_group, direction, n_hits) %>% 
+    dplyr::mutate(main_group = factor(main_group),
+                  direction = factor(direction))
+  return(df)
+}
+```
+   
+Type, state   
+```{r}
+typestate_files = list.files("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/230113_pseudobulk_analysis",
+                             pattern = "230113_pseudobulk_typestate_.+_subset.+\\.csv$",
+                             full.names = T)
+typestate_sum = summarize_hits(files = typestate_files,
+                               prefix = "230113_pseudobulk_typestate_")
+```
+   
+```{r}
+ggplot(typestate_sum, aes(x = main_group, y = n_hits, fill = direction)) +
+  geom_bar(stat = "identity") +
+  theme_bw(base_family = "Arial") +
+  scale_fill_npg(name = "") +
+  labs(x = "Cell Type and State", y = "Differentially Expressed genes, COVID-19 / Control")
+```
+   
+Cell type, alone   
+```{r}
+celltype_files = list.files("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/230113_pseudobulk_analysis",
+                             pattern = "230114_pseudobulk_celltype_.+_subset.+\\.csv$",
+                             full.names = T)
+celltype_sum = summarize_hits(files = celltype_files,
+                               prefix = "230114_pseudobulk_celltype_")
+```
+   
+```{r}
+ggplot(celltype_sum, aes(x = main_group, y = n_hits, fill = direction)) +
+  geom_bar(stat = "identity") +
+  theme_bw(base_family = "Arial") +
+  scale_fill_npg(name = "") +
+  labs(x = "Cell Type", y = "Differentially Expressed genes, COVID-19 / Control")
+```   
+   
+### Individual genes      
+```{r}
+collect_gene_hits = function(files, prefix){
+  comps = files %>% 
+    basename() %>% 
+    gsub(pattern = prefix, replacement = "", .) %>% 
+    substring(1, regexpr("\\_subset", .) - 1)
+  
+  hit_lists = lapply(files, function(x){
+    read.csv(x) %>% 
+      dplyr::filter(padj < 0.05) %>% 
+      dplyr::select(external_gene_name, baseMean:padj) %>% 
+      dplyr::mutate(across(baseMean:padj, .fns = ~ signif(.x, digits = 2))) %>% 
+      unique() %>% 
+      arrange(desc(log2FoldChange)) })
+  names(hit_lists) = comps
+  
+  return(hit_lists)
+}
+```
+   
+Type, state   
+```{r}
+typestate_hits = collect_gene_hits(files = typestate_files,
+                               prefix = "230113_pseudobulk_typestate_")
+
+write.csv(typestate_hits$`Microglia, DAM`, "/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/230113_pseudobulk_analysis/230113_typestate_hit_summary_Microglia_DAM.csv")
+write.csv(typestate_hits$`Microglia, Homeostatic`, "/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/230113_pseudobulk_analysis/230113_typestate_hit_summary_Microglia_Homeostatic.csv")
+```
+   
+Cell type, alone   
+```{r}
+celltype_hits = collect_gene_hits(files = celltype_files,
+                               prefix = "230113_pseudobulk_celltype_")
+
+write.csv(celltype_hits$Microglia, "/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/230113_pseudobulk_analysis/230113_celltype_hit_summary_Microglia.csv")
+```
+      
+# Data output   
+## Plots   
+### Sample mixture UMAP   
+```{r}
+final$Library = factor(final$orig.ident)
+mixture_umap = DimPlot(final, group.by = "Library", label = T, label.size = 5) +
+  NoLegend() +
+  scale_color_npg(name = "scRNA Library") +
+  labs(title = "", x = "UMAP 1", y = "UMAP 2")
+mixture_umap
+
+CairoPDF("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220607_cleaned_mixture_UMAP.pdf",
+    width = 12,
+    height = 9, 
+    family = "Arial")
+mixture_umap
+dev.off()
+```   
+   
+### Celltype UMAP   
+```{r}
+#ditto version:
+dittversion = dittoDimPlot(final, var = "combined", dim.1 = "UMAP_1", 
+                           dim.2 = "UMAP_2", do.label = T, labels.size = 8,
+                           opacity = 0.7, labels.repel = T, do.raster = T, 
+                           raster.dpi = 300) +
+  labs(x = "UMAP 1", y = "UMAP 2", title = "") +
+  scale_color_manual(values = nature_pal_long) +
+  theme(legend.position = "none",
+        axis.text.x = element_text(size = 24),
+        axis.text.y = element_text(size = 24),
+        axis.title.x = element_text(size = 36),
+        axis.title.y = element_text(size = 36),
+         strip.text = element_text(size = 24))
+
+CairoPDF("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220905_cleaned_celltype_UMAP.pdf",
+    width = 12,
+    height = 9, 
+    family = "Arial")
+dittversion
+dev.off()
+```
+
+
+   
+### Marker heatmap   
+```{r}
+CairoPDF("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220607_cleaned_celltype_marker_heatmap.pdf",
+    width = 16,
+    height = 6, 
+    family = "Arial")
+marker_hm
+dev.off()
+
+CairoPNG("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220607_cleaned_celltype_marker_heatmap.png",
+    width = 16,
+    height = 6, 
+    res = 300,
+    units = "in",
+    family = "Arial")
+marker_hm
+dev.off()
+```
+   
+## Celltype percentage by sort type   
+   
+SC225 was sorted as "microglia" rather than "not neutrophils"   
+   
+```{r}
+celltype_percentages = final %>% 
+  group_by(orig.ident) %>% 
+  mutate(total_cells = n()) %>% 
+  group_by(celltype, .add = T) %>% 
+  dplyr::summarize(pct_total = n() / total_cells * 100) %>% 
+  unique() %>% 
+  pivot_wider(names_from = celltype, values_from = pct_total)
+```
+   
+### Notify of completion   
+```{r}
+pbPost(title = "All complete")
+```
+   
+# Cytokine response signatures   
+## Download msigdb lists   
+```{bash eval=FALSE}
+cd /projects/b1038/Pulmonary/rgrant/resources/
+wget https://data.broadinstitute.org/gsea-msigdb/msigdb/release/7.5.1/msigdb.v7.5.1.entrez.gmt
+```
+   
+   
+## Add module scores   
+```{r}
+msigdb = gmtPathways("/projects/b1038/Pulmonary/rgrant/resources/msigdb.v7.5.1.entrez.gmt")
+msig_of_interest = msigdb[c("PID_CXCR3_PATHWAY", "HALLMARK_TNFA_SIGNALING_VIA_NFKB",
+                            "REACTOME_SENESCENCE_ASSOCIATED_SECRETORY_PHENOTYPE_SASP", "REACTOME_CELLULAR_SENESCENCE",
+                            "HALLMARK_IL6_JAK_STAT3_SIGNALING", "REACTOME_INTERLEUKIN_1_SIGNALING",
+                            "REACTOME_INTERLEUKIN_6_SIGNALING", "REACTOME_MYD88_INDEPENDENT_TLR4_CASCADE")]
+
+msig_dfs = lapply(msig_of_interest, function(genes){
+  df = gene_conv %>% 
+    dplyr::filter(entrezgene_id %in% genes)
+  return(df) })
+msig_genes = lapply(msig_dfs, function(df){ return(df$feature) })
+names(msig_genes) = names(msig_of_interest)
+
+#add modules
+final = AddModuleScore(final,
+                         features = msig_genes,
+                         name = names(msig_genes),
+                         seed = 12345)
+```
+      
+## Group-wise comparisons   
+### Organize data   
+```{r}
+response_scores = final %>% 
+  dplyr::select(PID_CXCR3_PATHWAY1, HALLMARK_TNFA_SIGNALING_VIA_NFKB2, REACTOME_SENESCENCE_ASSOCIATED_SECRETORY_PHENOTYPE_SASP3,
+                REACTOME_CELLULAR_SENESCENCE4, HALLMARK_IL6_JAK_STAT3_SIGNALING5, REACTOME_INTERLEUKIN_1_SIGNALING6,
+                REACTOME_INTERLEUKIN_6_SIGNALING7, REACTOME_MYD88_INDEPENDENT_TLR4_CASCADE8, main_group, celltype, sample)
+
+response_score_sum = response_scores %>% 
+  group_by(main_group, celltype, sample) %>% 
+  dplyr::summarize(across(.cols = , .fns = list(mean = mean, median = median, sd = sd), .names = "{.fn}__{.col}"))
+```
+    
+### Pairwise comparisons   
+   
+Normal?   
+```{r}
+response_scores_long = response_score_sum %>% 
+  dplyr::select(starts_with("median__"), main_group, celltype, sample) %>% 
+  pivot_longer(cols = starts_with("median__"), names_to = "pathway", values_to = "score") %>% 
+  mutate(pathway = gsub("median__", "", pathway))
+
+ggplot(response_scores_long, aes(x = score)) +
+  geom_histogram() +
+  facet_wrap(~ pathway)
+```   
+   
+Not horrible but not necessarily canonical Gaussian   
+   
+```{r}
+response_scores_long %>% 
+  group_by(pathway) %>% 
+  dplyr::summarize(pval = shapiro.test(x = score)$p.value)
+```   
+   
+HALLMARK_TNFA_SIGNALING_VIA_NFKB, REACTOME_MYD88_INDEPENDENT_TLR4_CASCADE, and REACTOME_INTERLEUKIN_6_SIGNALING are significantly non-normal and have strange distributions as well. Better to run nonparametric here.   
+   
+Wilcox tests   
+```{r}
+pathway_pvals = response_scores_long %>% 
+  dplyr::mutate(celltype = factor(celltype)) %>% 
+  group_by(celltype, pathway) %>% 
+  dplyr::summarize(pval = wilcox.test(score ~ main_group)$p.value,
+                   max_value = max(score, na.rm = T)) %>% 
+  ungroup() %>% 
+  mutate(padj = p.adjust(pval, method = "fdr"),
+         xmin = as.numeric(celltype) - 0.2, #use factor levels as a guide
+         xmax = as.numeric(celltype) + 0.2,
+         yval = max_value * 1.1,
+         annot = format(pval, digits = 2, scientific = T))
+```
+
+       
+### CXCR3 pathway (CXCL10 receptor)   
+```{r}
+CXCR3_group_plot = response_score_sum %>% 
+  ggplot(aes(y = median__PID_CXCR3_PATHWAY1, 
+                         x = celltype, 
+                         fill = main_group)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.5, seed = 12345)) +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 45, hjust=1)) +
+  scale_fill_npg(name = "") +
+  labs(x = "", y = "CXCR3 PATHWAY Module Expression", title = "")
+
+CairoPNG("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220808_CXCR3_group_plot.png",
+    width = 10,
+    height = 6, 
+    units = "in",
+    dpi = 300,
+    family = "Arial")
+CXCR3_group_plot
+dev.off()
+
+CXCR3_group_plot
+```   
+   
+Nothing really, but this wasn't a major driver of the cytokine clustering, just a cool hit.     
+   
+### TNFa (biggest driver of cytokine clustering)   
+```{r}
+TNFa_group_plot = response_score_sum %>% 
+  ggplot(aes(y = median__HALLMARK_TNFA_SIGNALING_VIA_NFKB2, 
+                         x = celltype, 
+                         fill = main_group)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.5, seed = 12345)) +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 45, hjust=1)) +
+  scale_fill_npg(name = "") +
+  labs(x = "", y = "Hallmark TNF-α Signaling Via NFKB Module Expression", title = "") +
+  geom_signif(inherit.aes = F, 
+              data = subset(pathway_pvals, pathway == "HALLMARK_TNFA_SIGNALING_VIA_NFKB2" & pval < 0.05),
+              aes(xmin = xmin, xmax = xmax, annotations = annot, y_position = yval),
+              tip_length = 0,
+              textsize = 3, 
+              manual=TRUE) 
+
+CairoPDF("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220906_TNFa_group_plot.pdf",
+    width = 10,
+    height = 6, 
+    family = "Arial")
+TNFa_group_plot
+dev.off()
+
+TNFa_group_plot
+```   
+   
+Plot just microglia for poster:   
+```{r}
+TNFa_microglia_plot = response_score_sum %>% 
+  dplyr::filter(celltype == "Microglia") %>% 
+  dplyr::mutate(module = "Hallmark TNF-α Signaling Via NFKB\n(M5890)") %>% 
+  ggplot(aes(y = median__HALLMARK_TNFA_SIGNALING_VIA_NFKB2, 
+                         x = main_group, 
+                         fill = main_group)) +
+  geom_boxplot(outlier.shape = NA) +
+  facet_wrap(~ module) +
+  geom_jitter(width = 0.3) +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(size = 24),
+        axis.text.y = element_text(size = 24),
+        axis.title.x = element_text(size = 36),
+        axis.title.y = element_text(size = 36),
+        strip.background = element_blank(),
+         strip.text = element_text(size = 36)) +
+  scale_fill_npg(name = "") +
+  labs(x = "", y = "Median Module Score") +
+  geom_signif(inherit.aes = F, 
+              data = subset(pathway_pvals, pathway == "HALLMARK_TNFA_SIGNALING_VIA_NFKB2" & pval < 0.05 & celltype == "Microglia"),
+              aes(xmin = "COVID-19", xmax = "Control", annotations = annot, y_position = yval),
+              tip_length = 0,
+              textsize = 9, 
+              manual=TRUE) 
+
+CairoPDF("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220908_TNFa_microglia_plot.pdf",
+    width = 3.3,
+    height = 4, 
+    family = "Arial")
+TNFa_microglia_plot
+dev.off()
+saveRDS(TNFa_microglia_plot, "/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220908_TNFa_microglia_plot.rds")
+
+TNFa_microglia_plot
+```   
+   
+There is real separation here!   
+   
+### IL-6 (hallmark)   
+```{r}
+IL6_hallmark_group_plot = response_score_sum %>% 
+  ggplot(aes(y = median__HALLMARK_IL6_JAK_STAT3_SIGNALING5, 
+                         x = celltype, 
+                         fill = main_group)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.5, seed = 12345)) +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 45, hjust=1)) +
+  scale_fill_npg(name = "") +
+  labs(x = "", y = "IL6 Hallmark Module Expression", title = "")
+  
+
+CairoPNG("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220808_IL6_hallmark_group_plot.png",
+    width = 10,
+    height = 6, 
+    units = "in",
+    dpi = 300,
+    family = "Arial")
+IL6_hallmark_group_plot
+dev.off()
+
+IL6_hallmark_group_plot
+```    
+   
+Slightly elevated in COVID across the board, although this includes essentially all Jak/Stat responsive signaling baked in.   
+   
+### IL-6 (reactome)   
+```{r}
+IL6_reactome_group_plot = response_score_sum %>% 
+  ggplot(aes(y = median__REACTOME_INTERLEUKIN_6_SIGNALING7, 
+                         x = celltype, 
+                         fill = main_group)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.5, seed = 12345)) +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 45, hjust=1)) +
+  scale_fill_npg(name = "") +
+  labs(x = "", y = "IL6 Reactome Module Expression", title = "")
+
+CairoPNG("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220808_IL6_reactome_group_plot.png",
+    width = 10,
+    height = 6, 
+    units = "in",
+    dpi = 300,
+    family = "Arial")
+IL6_reactome_group_plot
+dev.off()
+
+IL6_reactome_group_plot
+```   
+   
+IL-6-specific signaling seems to be about the same.   
+   
+### IL-1 (reactome)   
+```{r}
+IL1_reactome_group_plot = response_score_sum %>% 
+  ggplot(aes(y = median__REACTOME_INTERLEUKIN_1_SIGNALING6, 
+                         x = celltype, 
+                         fill = main_group)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.5, seed = 12345)) +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 45, hjust=1)) +
+  scale_fill_npg(name = "") +
+  labs(x = "", y = "IL1 Reactome Module Expression", title = "")
+
+CairoPNG("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220808_IL1_reactome_group_plot.png",
+    width = 10,
+    height = 6, 
+    units = "in",
+    dpi = 300,
+    family = "Arial")
+IL1_reactome_group_plot
+dev.off()
+
+IL1_reactome_group_plot
+```   
+   
+Very comparable levels here as well.   
+      
+## Senescence   
+### General senescence  
+```{r}
+senescence_group_plot = response_score_sum %>% 
+  ggplot(aes(y = median__REACTOME_CELLULAR_SENESCENCE4, 
+                         x = celltype, 
+                         fill = main_group)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.5, seed = 12345)) +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 45, hjust=1)) +
+  scale_fill_npg(name = "") +
+  labs(x = "", y = "Senescence Module Expression", title = "")
+
+CairoPNG("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220808_senescence_group_plot.png",
+    width = 10,
+    height = 6, 
+    units = "in",
+    dpi = 300,
+    family = "Arial")
+senescence_group_plot
+dev.off()
+
+senescence_group_plot
+```    
+   
+Possibly a slight elevation in microglia, curiously a very strong elevation in monocytes.     
+   
+### SASP   
+```{r}
+sasp_group_plot = response_score_sum %>% 
+  ggplot(aes(y = median__REACTOME_SENESCENCE_ASSOCIATED_SECRETORY_PHENOTYPE_SASP3, 
+                         x = celltype, 
+                         fill = main_group)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.5, seed = 12345)) +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 45, hjust=1)) +
+  scale_fill_npg(name = "") +
+  labs(x = "", y = "SASP Module Expression", title = "")
+  
+  final %>% 
+  tidyseurat::ggplot(aes(y = REACTOME_SENESCENCE_ASSOCIATED_SECRETORY_PHENOTYPE_SASP3, 
+                         x = celltype, 
+                         fill = main_group)) +
+  geom_boxplot() +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        axis.text.x = element_text(angle = 45, hjust=1)) +
+  scale_fill_npg(name = "") +
+  labs(x = "", y = "SASP Module Expression", title = "")
+
+CairoPNG("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220808_sasp_group_plot.png",
+    width = 10,
+    height = 6, 
+    units = "in",
+    dpi = 300,
+    family = "Arial")
+sasp_group_plot
+dev.off()
+
+sasp_group_plot
+```    
+   
+Same trends with SASP as well. Very interesting.      
+   
+# P21 and inflammation   
+## Correlate with key inflammatory markers from microglia pseudobulk   
+### All microglia together, no filtering   
+```{r}
+goi = c("MKI67", "CENPF", "CDKN1A", "IL6", "IL1B", "CCL2", "CCL4", "CSF1", "C15orf48") %>% 
+  paste0("GRCh38-", .)
+
+sasp_counts = FetchData(final, vars = c(goi, "HALLMARK_TNFA_SIGNALING_VIA_NFKB2", "celltype")) %>% 
+  dplyr::filter(celltype == "Microglia") %>% 
+  dplyr::select(-celltype) %>% 
+  dplyr::rename_all(function(x){gsub("GRCh38-", "", x)}) %>% 
+  as.matrix()
+
+sasp_cors = cor(sasp_counts, method = "spearman")
+sasp_cors_test = cor.mtest(sasp_counts, method = "spearman")
+
+adjusted_p = p.adjust(c(sasp_cors_test$p), method = "fdr")
+p_matrix = matrix(adjusted_p, nrow = nrow(sasp_cors_test$p))
+rownames(p_matrix) = rownames(sasp_cors_test$p)
+colnames(p_matrix) = colnames(sasp_cors_test$p)
+  
+corrplot(sasp_cors, 
+         p.mat = p_matrix, 
+         method = "color",
+         sig.level = 0.05, outline = T,
+         order = "hclust", 
+         tl.srt = 45,
+         tl.cex = 0.7,
+         col = rev(COL2('RdBu', 10)),
+         hclust.method = "ward.D2",
+         tl.col = "black")
+```   
+   
+### Only COVID (including long covid), no filtering   
+```{r}
+sasp_counts = FetchData(final, vars = c(goi, "HALLMARK_TNFA_SIGNALING_VIA_NFKB2", "celltype", "main_group")) %>% 
+  dplyr::filter(celltype == "Microglia" & main_group == "COVID-19") %>% 
+  dplyr::select(-celltype, -main_group) %>% 
+  dplyr::rename_all(function(x){gsub("GRCh38-", "", x)}) %>% 
+  as.matrix()
+
+sasp_cors = cor(sasp_counts, method = "spearman")
+sasp_cors_test = cor.mtest(sasp_counts, method = "spearman")
+
+adjusted_p = p.adjust(c(sasp_cors_test$p), method = "fdr")
+p_matrix = matrix(adjusted_p, nrow = nrow(sasp_cors_test$p))
+rownames(p_matrix) = rownames(sasp_cors_test$p)
+colnames(p_matrix) = colnames(sasp_cors_test$p)
+  
+corrplot(sasp_cors, 
+         p.mat = p_matrix, 
+         method = "color",
+         sig.level = 0.05, outline = T,
+         #order = "hclust", 
+         tl.srt = 45,
+         tl.cex = 0.7,
+         col = rev(COL2('RdBu', 10)),
+         hclust.method = "ward.D2",
+         tl.col = "black")
+```   
+   
+### Only true COVID, no filtering   
+```{r}
+sasp_counts = FetchData(final, vars = c(goi, "HALLMARK_TNFA_SIGNALING_VIA_NFKB2", "celltype", "group")) %>% 
+  dplyr::filter(celltype == "Microglia" & group == "COVID-19") %>% 
+  dplyr::select(-celltype, -group) %>% 
+  dplyr::rename_all(function(x){gsub("GRCh38-", "", x)}) %>% 
+  as.matrix()
+
+sasp_cors = cor(sasp_counts, method = "spearman")
+sasp_cors_test = cor.mtest(sasp_counts, method = "spearman")
+
+adjusted_p = p.adjust(c(sasp_cors_test$p), method = "fdr")
+p_matrix = matrix(adjusted_p, nrow = nrow(sasp_cors_test$p))
+rownames(p_matrix) = rownames(sasp_cors_test$p)
+colnames(p_matrix) = colnames(sasp_cors_test$p)
+  
+corrplot(sasp_cors, 
+         p.mat = p_matrix, 
+         method = "color",
+         sig.level = 0.05, outline = T,
+         #order = "hclust", 
+         tl.srt = 45,
+         tl.cex = 0.7,
+         col = rev(COL2('RdBu', 10)),
+         hclust.method = "ward.D2",
+         tl.col = "black")
+```   
+   
+## Unbiased correlations   
+### All bulk hits   
+```{r}
+bulk_hits = read.csv("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220808_microglia_bulk_results.csv") %>% 
+  dplyr::filter(padj < 0.05) %>% 
+  .$X
+
+bulk_hit_counts = FetchData(final, vars = bulk_hits) %>% 
+  as.matrix()
+
+bulk_hit_cors = cor(bulk_hit_counts, method = "spearman")
+bulk_hit_cors_test = cor.mtest(bulk_hit_counts, method = "spearman")
+
+adjusted_p = p.adjust(c(bulk_hit_cors_test$p), method = "fdr")
+p_matrix = matrix(adjusted_p, nrow = nrow(bulk_hit_cors_test$p))
+rownames(p_matrix) = rownames(bulk_hit_cors_test$p)
+colnames(p_matrix) = colnames(bulk_hit_cors_test$p)
+  
+corrplot(bulk_hit_cors, 
+         p.mat = p_matrix, 
+         method = "color",
+         sig.level = 0.05, outline = T,
+         #order = "hclust", 
+         tl.srt = 45,
+         tl.cex = 0.7,
+         col = rev(COL2('RdBu', 10)),
+         hclust.method = "ward.D2",
+         tl.col = "black")
+```
+   
+# Paper figures   
+## Figure 1: Microglia undergo concerted shifts toward an immunosenescent-like cell state in COVID-19   
+```{r}
+division_boxplots = readRDS("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220721_microglia_covid_division_hits.rds")
+microglia_covid_MA = readRDS("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220721_microglia_covid_MA.rds")
+enrichment_plot = readRDS("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/230620_NFkB_GSEA.rds")
+image_panel = cowplot::ggdraw() + 
+  cowplot::draw_image(
+    magick::image_read("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/230717_image_panel_v4.png", density = 300), scale = 1.035, hjust = 0.015, vjust = -0.175)
+
+
+layout = "ACDE\nBCFG\nHHHH\nHHHH"
+fig2 = dittversion +
+  cluster_percentages +
+  ggplotify::as.ggplot(
+    grid.grabExpr(
+      draw(binned_marker_hm, annotation_legend_side = "bottom", heatmap_legend_side = "bottom", merge_legend = TRUE)), 
+    scale = 1.0) +
+  microglia_covid_MA +  
+  division_boxplots + 
+  enrichment_plot +
+  TNFa_microglia_plot +
+  image_panel +
+  plot_layout(design = layout) + 
+  plot_annotation(tag_levels = 'a') & theme(plot.tag = element_text(size = 40, family = "Arial"))
+
+CairoPDF("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/230207_human_microglia_figure.pdf",
+    width = 50,
+    height = 50, 
+    family = "Arial")
+fig2
+dev.off()
+```

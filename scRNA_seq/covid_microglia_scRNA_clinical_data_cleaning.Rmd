@@ -1,0 +1,345 @@
+---
+title: "COVID Microglia scRNA Clinical Data Cleaning"
+output: html_notebook
+---
+
+# Setup   
+## Import packages   
+```{r}
+library(tidyverse)
+library(readxl)
+library(ggplot2)
+library(ggsci)
+library(ggsignif)
+library(patchwork)
+library(Cairo)
+library(gridExtra)
+library(grid)
+library(gtable)
+library(qwraps2)
+```   
+   
+# Clean and export data   
+## Load and clean   
+```{r}
+raw = read_excel(XXXXX,
+                 na = c("", "NA", "n/a", "unknown"),
+                 .name_repair = "universal",
+                 n_max = 11) %>% 
+  dplyr::rename_with(function(x) {gsub("\\_$", "", gsub("\\_\\_", "_", gsub("\\.", "_", x)))}) %>% 
+  #clear empty rows because Excel is a disaster
+  dplyr::filter(!is.na(Participant_ID)) %>% 
+  dplyr::select(-c(Year_of_birth, Zip_Code, Height_cm, Weight_on_admission)) %>% 
+  dplyr::rename(sample = Participant_ID, race = Race_other__3_asian__2_black_or_african_american__1_white_0, 
+                ethnicity = Ethnicity_hispanic_1, sex = Sex_1_female_0_male,
+                age = Age_at_date_of_death, time_of_death = Time_of_Death,
+                time_of_autopsy = Time_of_Autopsy) %>% 
+  #recode to human readable
+  mutate(race = factor(case_when(race == 2 ~ "Asian",
+                          race == 1 ~ "Black or African-American",
+                          race == 0 ~ "White",
+                          race == 3 ~ "Other",
+                          TRUE ~ NA_character_)),
+         ethnicity = factor(case_when(ethnicity == 1 ~ "Hispanic or Latino",
+                               ethnicity == 0 ~ "Not Hispanic or Latino",
+                               TRUE ~ NA_character_)),
+         sex = factor(case_when(sex == 1 ~ "Female",
+                                sex == 0 ~ "Male",
+                                TRUE ~ NA_character_)),
+         time_of_autopsy = as.POSIXct(time_of_autopsy, format = "%I:%M%p %m/%j/%Y"),
+         time_of_death = as.POSIXct(time_of_death,format = "%I:%M%p %m/%j/%Y"),
+         pmi_hours = as.numeric(difftime(time_of_autopsy, time_of_death, units = "hours")),
+         days_of_intubation = Duration_of_intubation) %>% 
+  #remove preceding zeros
+  dplyr::mutate(MRN = gsub("^0+", "", MRN)) %>% 
+  # Add COVID info
+  mutate(group = factor(case_when((!is.na(Date_of_First_Positive_COVID_Test) | 
+                                        !is.na(Date_of_First_Negative_COVID_test_after_Positive) |
+                                        grepl("COVID", Cause_of_death)) ~ "COVID-19",
+                                      TRUE ~ "Control"),
+                        levels = c("COVID-19", "Control"))) %>% 
+  # Categorize as inflammatory vs non
+  mutate(inflammatory_condition = factor(case_when(group == "COVID-19" | grepl("septic", Cause_of_death) ~ "Inflammatory",
+                                         TRUE ~ "Non-Inflammatory"))) %>% 
+  #remove unused samples
+  dplyr::filter(!(sample %in% c(XXXXX))) %>% 
+  rowwise() %>% 
+  dplyr::mutate(days_of_intubation = case_when(is.na(Date_of_first_intubation) ~ 0,
+                                               #for intubations ending in living extubation
+                                               (!is.na(Date_of_first_intubation) & 
+                                                 !is.na(Date_of_first_extubation)) |
+                                                 (!is.na(Date_of_second_intubation) &
+                                                    !is.na(Date_of_second_extubation)) ~ as.numeric(
+                                                      sum(
+                                                        difftime(
+                                                          Date_of_first_extubation, 
+                                                          Date_of_first_intubation, 
+                                                          units = "days"),
+                                                        difftime(
+                                                          Date_of_second_extubation, 
+                                                          Date_of_second_intubation, 
+                                                          units = "days"),
+                                                        na.rm = T)),
+                                               #for one intubation ending in death
+                                               (!is.na(Date_of_first_intubation) & 
+                                                 is.na(Date_of_first_extubation)) |
+                                                 (is.na(Date_of_second_intubation) &
+                                                    is.na(Date_of_second_extubation)) ~ as.numeric(
+                                                      difftime(
+                                                        time_of_death, 
+                                                        Date_of_first_intubation, 
+                                                        units = "days")),
+                                               #for two intubations ending in death
+                                               (!is.na(Date_of_first_intubation) & 
+                                                 !is.na(Date_of_first_extubation)) |
+                                                 (!is.na(Date_of_second_intubation) &
+                                                    is.na(Date_of_second_extubation)) ~ as.numeric(
+                                                      sum(
+                                                        difftime(
+                                                          Date_of_first_extubation, 
+                                                          Date_of_first_intubation, 
+                                                          units = "days"),
+                                                        difftime(
+                                                          time_of_death, 
+                                                          Date_of_second_intubation, 
+                                                          units = "days"),
+                                                        na.rm = T)),
+                                               TRUE ~ NA_real_),
+                days_in_icu = case_when(admitted_to_ICU == 0 ~ 0,
+                                        admitted_to_ICU == 1 ~ as.numeric(
+                                          difftime(
+                                            time_of_death, 
+                                            Date_of_ICU_admission, 
+                                            units = "days")))) %>% 
+  ungroup()
+```
+   
+## Add SCRIPT data?   
+### Identify any SCRIPT overlap   
+```{r}
+script_pts = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/220502 STU00204868_subjects_05_02_2022.csv",
+                      na.strings = c("", "NA"),
+                      strip.white = T,
+                      check.names = T, 
+                      colClasses = rep("character", 10)) %>% 
+  separate_rows(case.number, sep = ", ")  %>% #uncollapse ID column
+  dplyr::select(script_id = case.number, MRN = nmhc_record_number) %>% 
+  #remove preceding zeros
+  dplyr::mutate(MRN = gsub("^0+", "", MRN))
+
+raw = left_join(raw, script_pts)
+
+raw %>% 
+  dplyr::filter(!is.na(script_id)) %>% 
+  dplyr::select(sample, script_id)
+```
+
+   
+## Export safe   
+```{r}
+safe = raw %>% 
+  dplyr::select(-MRN)
+```
+   
+```{r eval=FALSE}
+write.csv(safe, "~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/human_microglia_scRNA/220606_microglia_clinical_dataset_cleaned_safe.csv")
+```
+   
+## Cohort demographics table (table 1)   
+### By patient      
+```{r}
+cohort_sum = safe %>% 
+  dplyr::mutate(Patient = as.numeric(factor(sample)),
+                days_from_first_positive = difftime(Date_of_death, 
+                                                    Date_of_First_Positive_COVID_Test,
+                                                    units = "days"),
+                BMI_on_admission = round(BMI_on_admission, digits = 1),
+                PTA_Cognitive_Impairment_dementia_alzheimers_etc =
+                  as.logical(PTA_Cognitive_Impairment_dementia_alzheimers_etc),
+                race = str_wrap(race, 20),
+                ethnicity = str_wrap(ethnicity, 20)) %>% 
+  rowwise() %>% 
+  dplyr::mutate(Cause_of_death = str_wrap(gsub(pattern = "^.", 
+                                      replacement = toupper(substring(Cause_of_death, 1, 1)),
+                                      Cause_of_death), 20)) %>% 
+  ungroup() %>% 
+  dplyr::select(Patient, group, Cause_of_death, age:ethnicity, days_from_first_positive, Peak_SOFA,
+                Peak_troponin_I_high_sensitivity, PTA_Cognitive_Impairment_dementia_alzheimers_etc) %>% 
+  dplyr::rename(Group = group, `Cause of Death` = Cause_of_death, Age = age, 
+                Sex = sex, BMI = BMI_on_admission, Race = race,
+                Ethnicity = ethnicity,
+                `Days from First\nPositive COVID-19 Test` = days_from_first_positive,
+                `Peak SOFA Score` = Peak_SOFA, `Peak Troponin-I` = Peak_troponin_I_high_sensitivity,
+                `Cognitive Impairment` = PTA_Cognitive_Impairment_dementia_alzheimers_etc) %>% 
+  dplyr::arrange(Group, Patient)
+```
+   
+```{r}
+g = tableGrob(cohort_sum, rows = NULL, theme = ttheme_minimal(base_family = "Arial"))
+separators_vert = replicate(ncol(cohort_sum) - 1,
+                     segmentsGrob(x1 = unit(0, "npc"), gp=gpar()),
+                     simplify=FALSE)
+separators_horiz = replicate(nrow(cohort_sum),
+                     segmentsGrob(y1 = unit(0, "npc"), gp=gpar()),
+                     simplify=FALSE)
+
+g = gtable_add_grob(g,
+                     grobs = segmentsGrob(
+                       x0 = unit(0,"npc"),
+                       y0 = unit(0,"npc"),
+                       x1 = unit(1,"npc"),
+                       y1 = unit(0,"npc"),
+                       gp = gpar(lwd = 2.0)),
+        t = 1, b = 1, l = 1, r = ncol(cohort_sum))
+g = gtable_add_grob(g, grobs = separators_vert,
+                     t = 1, b = nrow(g), l = seq_len(ncol(g) - 1) + 1)
+g = gtable_add_grob(g, grobs = separators_horiz,
+                     l = 1, r = ncol(g), t = seq_len(nrow(g) - 1))
+
+
+CairoPDF("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/human_microglia_scRNA/220816_cohort_table1.pdf",
+         width = 16,
+         height = 6)
+grid.draw(g)
+dev.off()
+```
+   
+### By group   
+```{r results='asis'}
+#rm(mean_sd) #otherwise interferes with qwraps2
+options(qwraps2_markup = "markdown")
+options(qwraps2_frmt_digits = 1)
+summary_data = safe %>%
+  dplyr::mutate(SOFA = round(Peak_SOFA, digits = 1),
+                CRP = round(Peak_CRP, digits = 1),
+                `Postmortem Interval (hours)` = round(pmi_hours, digits = 1),
+                `D-Dimer` = round(Peak_D_dimer, digits = 1),
+                Immunosuppressed = factor(case_when(PTA_Immunosuppresion == 1 ~ "Immunosuppressed",
+                                             PTA_Immunosuppresion == 0 ~ "Not Immunosuppressed",
+                                             TRUE ~ NA_character_)),
+                `Cardiac Arrest` = factor(case_when(Cardiac_arrest_with_rosc_prior_to_death == 1 ~ "Cardiac Arrest with ROSC",
+                                             Cardiac_arrest_with_rosc_prior_to_death == 0 ~ "No Cardiac Arrest with ROSC",
+                                             TRUE ~ NA_character_)),
+                `Smoking Status` = factor(case_when(PTA_smoking == 1 & 
+                                                      (!is.na(Stopped_smoking_date) & 
+                                                      Stopped_smoking_date > 0) ~ "Past Smoker",
+                                                    PTA_smoking == 1 & 
+                                                      (is.na(Stopped_smoking_date) | 
+                                                      Stopped_smoking_date == 0) ~ "Current Smoker",
+                                             PTA_smoking == 0 ~ "Never Smoker",
+                                             TRUE ~ NA_character_)),
+                Cancer = factor(case_when(PTA_cancer == 1 ~ "Diagnosed",
+                                          PTA_cancer == 0 ~ "Not Diagnosed",
+                                          TRUE ~ NA_character_)),
+                `Cognitive Impairment` = factor(case_when(PTA_Cognitive_Impairment_dementia_alzheimers_etc == 1 ~ "Diagnosed",
+                                          PTA_Cognitive_Impairment_dementia_alzheimers_etc == 0 ~ "Not Diagnosed",
+                                          TRUE ~ NA_character_)),
+                `Type I Diabetes` = factor(case_when(PTA_diabetes_Mellitus_1_y == 1 ~ "Diagnosed",
+                                          PTA_diabetes_Mellitus_1_y == 0 ~ "Not Diagnosed",
+                                          TRUE ~ NA_character_)),
+                `Renal Disease` = factor(case_when(PTA_Chronic_Kidney_Disease == 1 ~ "Diagnosed",
+                                          PTA_Chronic_Kidney_Disease == 0 ~ "Not Diagnosed",
+                                          TRUE ~ NA_character_)),
+                `Venous Thromboembolism` = factor(case_when(PTA_Venous_thromboembolism == 1 ~ "Diagnosed",
+                                          PTA_Venous_thromboembolism == 0 ~ "Not Diagnosed",
+                                          TRUE ~ NA_character_)),
+                `Substance Use Disorder` = factor(case_when(PTA_substance_use_disorder == 1 |
+                                                              PTA_etoh_abuse == 1 ~ "Diagnosed",
+                                                            PTA_substance_use_disorder == 0 &
+                                                              PTA_etoh_abuse == 0 ~ "Not Diagnosed",
+                                          TRUE ~ NA_character_)),
+                Dexamethasone = factor(case_when(Received_dexamethasone == 1 ~ "Received Treatment",
+                                                 Received_dexamethasone == 0 ~ "Did Not Receive Treatment",
+                                          TRUE ~ NA_character_),
+                                       levels = c("Received Treatment", "Did Not Receive Treatment")),
+                Remdesivir = factor(case_when(Received_remdesivir == 1 ~ "Received Treatment",
+                                                 Received_remdesivir == 0 ~ "Did Not Receive Treatment",
+                                          TRUE ~ NA_character_),
+                                       levels = c("Received Treatment", "Did Not Receive Treatment")),
+                `IL-6 Blockers` = factor(case_when(Received_tocilizumab == 1 |
+                                                     Received_sarilumab == 1 ~ "Received Treatment",
+                                                   Received_tocilizumab == 0 &
+                                                     Received_sarilumab == 0 ~ "Did Not Receive Treatment",
+                                          TRUE ~ NA_character_),
+                                       levels = c("Received Treatment", "Did Not Receive Treatment")),
+                `Convalescent Plasma` = factor(case_when(Received_convalescent_plasma == 1 ~ "Received Treatment",
+                                                 Received_convalescent_plasma == 0 ~ "Did Not Receive Treatment",
+                                          TRUE ~ NA_character_),
+                                       levels = c("Received Treatment", "Did Not Receive Treatment")),
+                `Discharge Status` = "Deceased",
+                `Duration of Intubation (days)` = round(days_of_intubation, digits = 1),
+                `Length of ICU Stay (days)` = round(days_in_icu, digits = 1)) %>% 
+  dplyr::select(Diagnosis = group, 
+                Ethnicity = ethnicity, 
+                Race = race, 
+                `Age (years)` = age, 
+                Sex = sex, 
+                `Postmortem Interval (hours)`,
+                `BMI (kg/m2)` = BMI_on_admission, 
+                `Duration of Intubation (days)`, 
+                `Length of ICU Stay (days)`,
+                SOFA:`Convalescent Plasma`,
+                Diabetes = `Type I Diabetes`,
+                `Discharge Status`) %>% 
+  #add units
+  dplyr::rename(`CRP (mg/L)` = CRP,
+                `D-Dimer (ng/mL)` = `D-Dimer`) %>% 
+  dplyr::relocate(`Age (years)`, Sex, Race, Ethnicity, SOFA, 
+                  `Discharge Status`, `Duration of Intubation (days)`, `Length of ICU Stay (days)`, `BMI (kg/m2)`, 
+                  `Smoking Status`, `Postmortem Interval (hours)`, `Immunosuppressed`, `Cancer`, `Cardiac Arrest`, 
+                  `Cognitive Impairment`, Diabetes, `Renal Disease`, `Substance Use Disorder`, 
+                  `Venous Thromboembolism`, `Convalescent Plasma`, Dexamethasone, `IL-6 Blockers`,
+                  Remdesivir)
+
+summary_data_grouped = summary_data %>% 
+  group_by(Diagnosis) %>%
+  summary_table(.,
+                summaries = qsummary(dplyr::select(dplyr::ungroup(.), -Diagnosis), 
+                                     numeric_summaries = list("Minimum" = "~ min(%s)",
+                                         "Median (IQR)" = "~median_iqr(%s)",
+                                         "Mean (SD)" = "~mean_sd(%s)",
+                                         "Maximum" = "~ max(%s)"),
+                                     n_perc_args = list(digits = 1, show_symbol = TRUE, 
+                                                        show_denom = "never")))
+summary_data_whole = summary_data %>% 
+  summary_table(.,
+                summaries = qsummary(dplyr::select(dplyr::ungroup(.), -Diagnosis), 
+                                     numeric_summaries = list("Minimum" = "~ min(%s)",
+                                         "Median (IQR)" = "~median_iqr(%s)",
+                                         "Mean (SD)" = "~mean_sd(%s)",
+                                         "Maximum" = "~ max(%s)"),
+                                     n_perc_args = list(digits = 1, show_symbol = TRUE, 
+                                                        show_denom = "never")))
+colnames(summary_data_whole) = gsub("^\\.", "Total", colnames(summary_data_whole))
+
+summary_data_complete = cbind(summary_data_grouped, summary_data_whole)
+
+#output summarized data for scRNA output as well
+output = cbind(sample = safe$sample, summary_data)
+colnames(output) = colnames(output) %>% 
+  trimws() %>% 
+  tolower() %>%
+  gsub("[\\(\\)]", "", .) %>% #remove symbols
+  gsub(".g\\/.+", "", .) %>%  #remove units
+  trimws() %>% 
+  gsub("[ \\-]", "_", .) #fix spaces
+
+
+write.csv(output, 
+          "~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/human_microglia_scRNA/230720_scRNA_md.csv",
+          row.names = FALSE)
+
+#run as a job to keep r markdown from capturing the output
+job::job({
+sink(file = "~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/230705_summary_table_brain_scRNA.md", append = F)
+cat("---
+output:
+  pdf_document: default
+  output: default
+classoption: landscape, a2paper, 12pt
+---
+")
+print(summary_data_complete)
+sink(file = NULL)
+})
+```

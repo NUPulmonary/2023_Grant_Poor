@@ -1,0 +1,87 @@
+import scrublet as scr
+import scipy.io
+import os
+import gzip
+import pandas as pd
+import matplotlib.pyplot as plt
+import subprocess
+
+EXPECTED_DOUBLET_RATE = {
+  "SC224": 0.016,
+  "SC225": 0.061,
+  "SC233": 0.039,
+  "SC234": 0.08,
+  "SC238": 0.061,
+  "SC239": 0.039,
+  "SC240": 0.08,
+  "SC250": 0.10,
+  "SC294": 0.016,
+  "SC295": 0.061
+  }
+#Automatic detection is useless
+CUTOFFS = {
+  "SC224": 0.20,
+  "SC225": 0.22,
+  "SC233": 0.23,
+  "SC234": 0.3,
+  "SC238": 0.23,
+  "SC239": 0.21,
+  "SC240": 0.28,
+  "SC250": 0.32,
+  "SC294": 0.20,
+  "SC295": 0.23
+  }
+
+rule all:
+  input:
+    expand("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/scrublet/{sample}_doublets.csv", sample=["SC224", "SC225", "SC233", "SC234", "SC238", "SC239", "SC240", "SC250", "SC294", "SC295"]),
+    expand("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/scrublet/{sample}_threshold.txt", sample=["SC224", "SC225", "SC233", "SC234", "SC238", "SC239", "SC240", "SC250", "SC294", "SC295"]),
+    expand("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/scrublet/{sample}_histogram.pdf", sample=["SC224", "SC225", "SC233", "SC234", "SC238", "SC239", "SC240", "SC250", "SC294", "SC295"]),
+    expand("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/scrublet/{sample}_umap.pdf", sample=["SC224", "SC225", "SC233", "SC234", "SC238", "SC239", "SC240", "SC250", "SC294", "SC295"])
+
+rule scrublet:
+  input:
+    "/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/cellranger/{sample}/outs/filtered_feature_bc_matrix/matrix.mtx.gz",
+    "/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/cellranger/{sample}/outs/filtered_feature_bc_matrix/barcodes.tsv.gz"
+  output:
+    "/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/scrublet/{sample}_doublets.csv",
+    "/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/scrublet/{sample}_threshold.txt",
+    "/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/scrublet/{sample}_histogram.pdf",
+    "/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/scrublet/{sample}_umap.pdf"
+    
+  params:
+    slurm__hours=1,
+    slurm__cores=1,
+    slurm__mem=8,
+    edr = lambda wildcards, input: EXPECTED_DOUBLET_RATE.get(wildcards.sample),
+    cutoff = lambda wildcards, input: CUTOFFS.get(wildcards.sample)
+  run:
+    subprocess.run("module load gcc/11.2.0", shell=True)
+    counts_matrix = scipy.io.mmread(gzip.open(input[0])).T.tocsc()
+    barcodes = pd.read_table(gzip.open(input[1]), header=None)
+    scrub = scr.Scrublet(counts_matrix, expected_doublet_rate = params.edr)
+    doublet_scores, doublets = scrub.scrub_doublets(min_counts=2,
+                                                    min_cells=3,
+                                                    min_gene_variability_pctl=85,
+                                                    n_prin_comps=30)
+    
+    #just go with manual
+    scrub.call_doublets(threshold = params.cutoff)
+    
+    #output doublet scores
+    barcodes['doublet'] = doublet_scores
+    barcodes.to_csv(output[0])
+    
+    #output cutoffs (not important now that we did manually)
+    if not os.path.exists(output[1]):
+        with open(output[1], 'w') as f:
+            f.write(str(scrub.threshold_))
+            
+    #output theshold plot
+    scrub.plot_histogram()
+    plt.savefig(output[2])
+    
+    #output UMAP plot
+    scrub.set_embedding('UMAP', scr.get_umap(scrub.manifold_obs_, n_neighbors=10, min_dist=0.2, metric='cosine'))
+    scrub.plot_embedding('UMAP', order_points=True)
+    plt.savefig(output[3])

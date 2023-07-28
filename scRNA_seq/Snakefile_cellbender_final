@@ -1,0 +1,45 @@
+EXPECTED_CELLS = {
+  "SC224": 1917,
+  "SC225": 8366,
+  "SC233": 4536,
+  "SC234": 13021,
+  "SC238": 7829,
+  "SC239": 4917,
+  "SC240": 11856,
+  "SC250": 14851,
+  "SC294": 3088,
+  "SC295": 9000
+  }
+
+rule all:
+  input:
+    expand("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/cellbender/{sample}_filtered.h5", sample=["SC224", "SC225", "SC233", "SC234", "SC238", "SC239", "SC240", "SC250", "SC294", "SC295"])
+
+rule cellbender:
+  input:
+    "/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/cellranger/{sample}/outs/raw_feature_bc_matrix.h5"
+  output:
+    "/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/cellbender/{sample}_filtered.h5"
+  params:
+    slurm__hours=6,
+    slurm__cores=8,
+    slurm__mem=40,
+    slurm__partition="genomics-gpu",
+    slurm__account="b1042",
+    slurm__gres="gpu:a100:1",
+    expected_cells = lambda wildcards, input: EXPECTED_CELLS.get(wildcards.sample)
+  shell:
+    """
+    input=`realpath {input}`
+    output=`realpath {output}`
+    output="${{output%_filtered.h5}}.h5"
+    cellbender remove-background \
+    --cuda \
+    --input "$input" \
+    --output "$output" \
+    --expected-cells {params.expected_cells} \
+    --total-droplets-included 30000 \
+    --fpr 0.01 \
+    --epochs 150 \
+    --learning-rate 5e-5
+    """

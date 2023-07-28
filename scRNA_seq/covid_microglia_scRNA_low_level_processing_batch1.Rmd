@@ -1,0 +1,731 @@
+---
+title: "Human COVID microglia scRNA low-level processing"
+output: html_notebook
+---
+   
+# Setup   
+## Goals   
+   
+1. Rerun all analysis using cellranger 7 with introns excluded (and without cellbender)        
+      
+## Load packages etc.  
+```{r}
+library(tidyverse)
+library(SoupX)
+library(Seurat)
+library(tidyseurat)
+library(googlesheets4)
+library(googledrive)
+library(ggsci)
+library(Cairo)
+library(gridExtra)
+library(grid)
+```
+   
+# Run pipelines   
+## Run in-house cellranger pipeline (my edits)   
+### Submission script   
+```{bash eval=FALSE}
+cd /projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/merged_data/EBV1
+screen
+source /projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/human_microglia_venv/bin/activate
+
+snakemake -s /home/rag0151/utils/snakemake/pipelines/cellranger_pipeline_7 \
+--cluster-config '/home/rag0151/.slurm.json' \
+--config sample_csv_path='/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/raw/samplesheet_human_microglia_final.csv' \
+data_dir='/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final' \
+cellranger_dir='/projects/b1038/Pulmonary/bin/cellranger-7.0.1' \
+transcriptome='/projects/b1038/Pulmonary/genomes/GRCh38_and_SARS-CoV-2_NC45512.2_and_EBV1_NC007605.1/' \
+include_introns='False' \
+mode='complete' \
+input_fastq_type='gex' \
+antibodies='None' \
+gex_fastqs='None' \
+--cluster /projects/b1038/tools/snakemake/cluster.py \
+-j 1000 \
+-n
+
+snakemake -s /home/rag0151/utils/snakemake/pipelines/cellranger_pipeline_7 \
+--cluster-config '/home/rag0151/.slurm.json' \
+--config sample_csv_path='/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/raw/samplesheet_human_microglia_final.csv' \
+data_dir='/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final' \
+cellranger_dir='/projects/b1038/Pulmonary/bin/cellranger-7.0.1' \
+transcriptome='/projects/b1038/Pulmonary/genomes/GRCh38_and_SARS-CoV-2_NC45512.2_and_EBV1_NC007605.1/' \
+include_introns='False' \
+mode='complete' \
+input_fastq_type='gex' \
+antibodies='None' \
+gex_fastqs='None' \
+--cluster /projects/b1038/tools/snakemake/cluster.py \
+-j 1000
+```   
+   
+# Cell calling (cellbender)   
+   
+Note: not using the actual matrix from this (problematic results). Only cell calling!!   
+   
+## Setup   
+### Snakefile   
+   
+~/aging_microglia_flu/230115_Snakefile_cellbender_final
+   
+```{python eval=FALSE}
+EXPECTED_CELLS = {
+  "SC224": 1917,
+  "SC225": 8366,
+  "SC233": 4536,
+  "SC234": 13021,
+  "SC238": 7829,
+  "SC239": 4917,
+  "SC240": 11856,
+  "SC250": 14851,
+  "SC294": 3088,
+  "SC295": 9000
+  }
+
+rule all:
+  input:
+    expand("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/cellbender/{sample}_filtered.h5", sample=["SC224", "SC225", "SC233", "SC234", "SC238", "SC239", "SC240", "SC250", "SC294", "SC295"])
+
+rule cellbender:
+  input:
+    "/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/cellranger/{sample}/outs/raw_feature_bc_matrix.h5"
+  output:
+    "/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/cellbender/{sample}_filtered.h5"
+  params:
+    slurm__hours=6,
+    slurm__cores=8,
+    slurm__mem=40,
+    slurm__partition="genomics-gpu",
+    slurm__account="b1042",
+    slurm__gres="gpu:a100:1",
+    expected_cells = lambda wildcards, input: EXPECTED_CELLS.get(wildcards.sample)
+  shell:
+    """
+    input=`realpath {input}`
+    output=`realpath {output}`
+    output="${{output%_filtered.h5}}.h5"
+    cellbender remove-background \
+    --cuda \
+    --input "$input" \
+    --output "$output" \
+    --expected-cells {params.expected_cells} \
+    --total-droplets-included 30000 \
+    --fpr 0.01 \
+    --epochs 150 \
+    --learning-rate 5e-5
+    """
+```
+   
+## Run pipe   
+```{bash eval=FALSE}
+cd /projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final
+screen
+source /projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/human_microglia_venv/bin/activate
+snakemake -s ~/aging_microglia_flu/230115_Snakefile_cellbender_final \
+--cluster-config '/home/rag0151/.slurm.json' \
+--cluster /projects/b1038/tools/snakemake/cluster.py \
+-j 1000 \
+-F \
+-n
+
+snakemake -s ~/aging_microglia_flu/230115_Snakefile_cellbender_final \
+--cluster-config '/home/rag0151/.slurm.json' \
+--cluster /projects/b1038/tools/snakemake/cluster.py \
+-j 1000 \
+-F
+``` 
+      
+# Ambient RNA removal (SoupX)   
+## Generate cleaned matrices   
+```{r eval=FALSE}
+sample_dirs = list.dirs("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/cellranger",
+                        recursive = F, full.names = T)
+adjusted = lapply(sample_dirs, function(dir){
+  sample =  basename(dir)
+  print(sample)
+  dir = paste0(dir, "/outs")
+  obj = SoupX::load10X(dir, verbose = 0) %>% 
+    autoEstCont(.)
+  
+  #output soup summary data
+  out_dir = paste0("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/SoupX/",
+                   sample)
+  if(!dir.exists(out_dir))
+  {
+    dir.create(out_dir)
+  }
+  write.csv(obj$fit$markersUsed, paste0(out_dir, "/markersUsed.csv"))
+  write.csv(obj$fit$dd, paste0(out_dir, "/dd.csv"))
+  write.csv(obj$soupProfile, paste0(out_dir, "/soupProfile.csv"))
+  
+  #return cleaned seurat object!
+  out = adjustCounts(obj)
+  return(out) })
+names(adjusted) = basename(sample_dirs)
+
+gc()
+```
+   
+# Merge into single Seurat object   
+## Merge SoupX-cleaned datasets (deprecated)   
+```{r eval=FALSE}
+deepseq = lapply(adjusted, CreateSeuratObject)
+deepseq = merge(x = deepseq[[1]], deepseq[2:length(deepseq)], 
+                add.cell.ids = names(deepseq), project = "human_microglia")
+gc()
+```   
+   
+## Merge cellranger datasets using cellbender whitelist      
+```{r}
+unfiltered_dirs = list.dirs(path = "/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/cellranger",
+                            recursive = F,
+                            full.names = T) 
+
+deepseq = lapply(unfiltered_dirs, function(dir){
+  sample = basename(dir)
+  unfiltered = paste0(dir, "/outs/raw_feature_bc_matrix")
+  cellbender_whitelist = read.csv(paste0("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/cellbender",
+                                         "/",
+                                         sample,
+                                         "_cell_barcodes.csv"), header = F) %>% 
+    .$V1
+  obj = Read10X(unfiltered) %>% 
+    CreateSeuratObject(., project = sample)
+  #perform cellbender filtering
+  obj = obj[, cellbender_whitelist]
+  return(obj) })
+names(deepseq) = basename(unfiltered_dirs)
+  
+deepseq = merge(x = deepseq[[1]], deepseq[2:length(deepseq)], 
+                add.cell.ids = names(deepseq), project = "human_microglia")
+gc()
+``` 
+   
+### Clean up gene names   
+```{r}
+deepseq@assays$RNA@counts@Dimnames[[1]] = gsub("\\-{3,}", "-", rownames(deepseq))
+deepseq@assays$RNA@data@Dimnames[[1]] = gsub("\\-{3,}", "-", rownames(deepseq))
+deepseq = PercentageFeatureSet(deepseq, pattern = "^GRCh38-MT", col.name = "pct_mito")
+deepseq = PercentageFeatureSet(deepseq, pattern = "^GRCh38-RP[SL]", col.name = "pct_ribo")
+```   
+   
+### Get viral counts before they get filtered   
+```{r}
+#SARS-CoV-2
+cov2_genes = rownames(deepseq)[grepl("^SARS-CoV-2-NC45512.2-", rownames(deepseq))]
+cov2_counts = FetchData(object = deepseq, vars = cov2_genes) %>% 
+  t() %>% 
+  as_tibble(rownames = NA) %>% 
+  rownames_to_column("Gene") %>%
+  mutate(Gene = factor(gsub("^SARS-CoV-2-NC45512.2-", "", Gene))) %>% 
+  pivot_longer(cols = -Gene, names_to = "Cell", values_to = "Counts")
+
+cov2_counts_plot = ggplot(cov2_counts, aes(x = Gene, y = Counts)) +
+  geom_boxplot() +
+  ylim(0, 1) +
+  theme_bw() +
+  labs(x = "", y = "Raw Counts") +
+  theme(axis.text.x = element_text(angle = 45, hjust=1))
+cov2_counts_plot
+
+cov2_counts_table = cov2_counts %>% 
+  group_by(Gene) %>% 
+  dplyr::summarize(`Total Counts` = sum(Counts, na.rm = T),
+                   `Mean Counts` = mean(Counts, na.rm = T),
+                   SD = sd(Counts, na.rm = T)) %>% 
+  as.data.frame()
+cov2_counts_table
+
+#export
+CairoPDF("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/230109_Cov2_counts_plot.pdf",
+    width = 6,
+    height = 4, 
+    family = "Arial")
+cov2_counts_plot
+dev.off()
+
+CairoPDF("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/230109_Cov2_counts_table.pdf",
+    width = 10,
+    height = 6, 
+    family = "Arial")
+grid.table(cov2_counts_table, rows = NULL)
+dev.off()
+
+#EBV1/HHV4
+ebv1_genes = rownames(deepseq)[grepl("^EBV1-NC007605.1-", rownames(deepseq))]
+ebv1_counts = FetchData(object = deepseq, vars = ebv1_genes) %>% 
+  t() %>% 
+  as_tibble(rownames = NA) %>% 
+  rownames_to_column("Gene") %>%
+  mutate(Gene = factor(gsub("^EBV1-NC007605.1-", "", Gene))) %>% 
+  pivot_longer(cols = -Gene, names_to = "Cell", values_to = "Counts")
+
+ebv1_counts_plot = ggplot(ebv1_counts, aes(x = Gene, y = Counts)) +
+  geom_boxplot() +
+  ylim(0, 1) +
+  theme_bw() +
+  labs(x = "", y = "Raw Counts") +
+  theme(axis.text.x = element_text(angle = 45, hjust=1))
+ebv1_counts_plot
+
+ebv1_counts_table = ebv1_counts %>% 
+  group_by(Gene) %>% 
+  dplyr::summarize(`Total Counts` = sum(Counts, na.rm = T),
+                   `Mean Counts` = mean(Counts, na.rm = T),
+                   SD = sd(Counts, na.rm = T)) %>% 
+  as.data.frame()
+ebv1_counts_table
+
+CairoPDF("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/230109_ebv1_counts_plot.pdf",
+    width = 16,
+    height = 6, 
+    family = "Arial")
+ebv1_counts_plot
+dev.off()
+```
+   
+## Standard filtering
+### Determine cutoffs   
+```{r}
+ggplot(data = NULL, aes(x = deepseq$nFeature_RNA)) +
+  geom_histogram(bins = 150) + 
+  scale_x_log10() +
+  scale_y_log10() +
+  geom_vline(xintercept = 100)
+
+detection = rowSums(deepseq@assays$RNA@counts > 0)
+ggplot(data = NULL, aes(x = detection)) +
+  geom_histogram(bins = 500) +
+  scale_x_log10() +
+  scale_y_log10() +
+  geom_vline(xintercept = 150)
+
+ggplot(data = NULL, aes(x = deepseq$pct_mito)) +
+  geom_histogram() +
+  geom_vline(xintercept = 20)
+
+ggplot(data = NULL, aes(x = deepseq$pct_ribo)) +
+  geom_histogram()
+```   
+   
+Following cutoffs look good: min.cells: 150, min.features: 100, pct_mito: 20.   
+   
+### Apply cutoffs   
+```{r}
+deepseq = lapply(unfiltered_dirs, function(dir){
+  sample = basename(dir)
+  unfiltered = paste0(dir, "/outs/raw_feature_bc_matrix")
+  cellbender_whitelist = read.csv(paste0("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/cellbender",
+                                         "/",
+                                         sample,
+                                         "_cell_barcodes.csv"), header = F) %>% 
+    .$V1
+  obj = Read10X(unfiltered) %>% 
+    CreateSeuratObject(., 
+                       project = sample,
+                       min.cells = 150,
+                       min.features = 100)
+  #perform cellbender filtering
+  obj = obj[, cellbender_whitelist]
+  return(obj) })
+names(deepseq) = basename(unfiltered_dirs)
+  
+deepseq = merge(x = deepseq[[1]], deepseq[2:length(deepseq)], 
+                add.cell.ids = names(deepseq), project = "human_microglia")
+gc()
+
+#fix absurd number of dashes in gene names   
+deepseq@assays$RNA@counts@Dimnames[[1]] = gsub("\\-{3,}", "-", rownames(deepseq))
+deepseq@assays$RNA@data@Dimnames[[1]] = gsub("\\-{3,}", "-", rownames(deepseq))
+deepseq = PercentageFeatureSet(deepseq, pattern = "^GRCh38-MT", col.name = "pct_mito")
+
+#mito filtering
+deepseq = deepseq %>% 
+  tidyseurat::filter(pct_mito < 20)
+
+dim(deepseq)
+```
+   
+## Metadata   
+### Sample metadata   
+```{r}
+# log in to the googles
+XXXXX
+
+#stream sheet
+brain_metadata = read_sheet(XXXXX,
+                          trim_ws = T,
+                          .name_repair = "universal", 
+                          sheet = "Sort Metadata",
+                          na = c("", "NA")) %>%
+  dplyr::filter(sample != XXXXX & !is.na(scrna_library)) %>% #treating combined as single sample
+  mutate(protocol_version = factor(protocol_version),
+         group = factor(group),
+         panel_version = factor(panel_version),
+         initial_processing_date = as.Date(initial_processing_date),
+         transferred_to_PBS = as.Date(transferred_to_PBS),
+         scrna_library = strsplit(scrna_library, split = ", "),
+         scRNAseq_batch = factor(scRNAseq_batch),
+         #fix mixed library
+         sample = ifelse(scrna_library == "SC224",
+                          yes = XXXXX,
+                          no = sample)) %>% 
+  mutate(days_in_fixative = as.numeric(difftime(transferred_to_PBS, initial_processing_date, units = "days"))) %>% 
+  unnest_longer(col = scrna_library)
+```
+   
+### Clinical data   
+```{r}
+clinical = read.csv("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220606_microglia_clinical_dataset_cleaned_safe.csv") %>% 
+  dplyr::select(-c(X, group)) #defining group differently now
+```   
+   
+### Join metadata   
+```{r}
+deepseq = deepseq %>% 
+  left_join(., brain_metadata, by = c("orig.ident" = "scrna_library")) %>% 
+  left_join(., clinical)
+
+table(deepseq$group, deepseq$orig.ident)
+```
+      
+# Demultiplex SC224 (souporcell)   
+## Setup   
+### Download essential files   
+```{bash eval=FALSE}
+#download recommended variant data for GRCh38
+cd /projects/b1038/Pulmonary/rgrant/resources/souporcell
+wget --load-cookies /tmp/cookies.txt "https://docs.google.com/uc?export=download&confirm=$(wget --quiet --save-cookies /tmp/cookies.txt --keep-session-cookies --no-check-certificate 'https://docs.google.com/uc?export=download&id=13aebUpEKrtjliyT9rYzRijtkNJVUk5F_' -O- | sed -rn 's/.*confirm=([0-9A-Za-z_]+).*/\1\n/p')&id=13aebUpEKrtjliyT9rYzRijtkNJVUk5F_" -O common_variants_grch38.vcf && rm -rf /tmp/cookies.txt
+
+#pull singularity image
+module load singularity
+singularity pull shub://wheaton5/souporcell
+```
+
+### Snakefile   
+   
+~/aging_microglia_flu/230109_snakefile_souporcell
+   
+```{python eval=FALSE}
+rule all:
+  input:
+    expand("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/souporcell/{sample}", sample=["SC224", "SC225", "SC233", "SC234", "SC238", "SC239", "SC240", "SC250", "SC294", "SC295"])
+  
+rule souporcell:
+  input:
+    "/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/cellranger/{sample}"
+  output:
+    directory("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/souporcell/{sample}")
+  params:
+    slurm__hours=8,
+    slurm__cores=12,
+    slurm__mem=80
+  shell:
+    """
+    module purge all
+    module load singularity
+    
+    gunzip -c /projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/cellranger/{wildcards.sample}/outs/filtered_feature_bc_matrix/barcodes.tsv.gz > \
+    /projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/cellranger/{wildcards.sample}/outs/filtered_feature_bc_matrix/barcodes.tsv
+    
+    sif=/projects/b1038/Pulmonary/rgrant/resources/souporcell/souporcell_latest.sif
+    vcf=/projects/b1038/Pulmonary/rgrant/resources/souporcell/common_variants_grch38.vcf
+    
+    singularity exec \
+    --bind /projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final:/data \
+    --bind $vcf \
+    --bind /projects/b1038/tools/refdata-cellranger-GRCh38-3.0.0:/ref-genome \
+    $sif souporcell_pipeline.py \
+    -i /data/cellranger/{wildcards.sample}/outs/possorted_genome_bam.bam \
+    -b /data/cellranger/{wildcards.sample}/outs/filtered_feature_bc_matrix/barcodes.tsv.gz \
+    -f /ref-genome/fasta/genome.fa \
+    --common_variants $vcf \
+    -t 12 \
+    -o /data/souporcell/{wildcards.sample} \
+    -k 2 \
+    -p 2
+    """
+```
+   
+## Run pipe   
+```{bash eval=FALSE}
+cd /projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq
+screen
+source /projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/human_microglia_venv/bin/activate
+module purge all
+snakemake -s /home/rag0151/aging_microglia_flu/230109_snakefile_souporcell \
+--cluster-config '/home/rag0151/.slurm.json' \
+--cluster /projects/b1038/tools/snakemake/cluster.py \
+-j 1000 \
+-n
+
+snakemake -s /projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/code/HMLHVDRXY/Snakefile_souporcell
+```   
+   
+## Split SC224   
+### Ensure detection of two genotypes   
+```{r}
+assignment_dirs = list.dirs("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/souporcell", 
+                        full.names = T, 
+                        recursive = F) 
+
+assignments = lapply(assignment_dirs, function(x) {
+  sample = basename(x)
+  tsv = read.delim(paste0(x, "/clusters.tsv"))
+  tsv$sample = sample
+  return(tsv)}) %>% 
+  bind_rows() %>% 
+  dplyr::filter(status == "singlet") %>% 
+  group_by(sample, assignment) %>% 
+  dplyr::summarize(count = n())
+
+ggplot(assignments, aes(x = sample, y = count, fill = assignment)) +
+  geom_bar(stat = "identity", position = "fill") +
+  theme_bw(base_family = "Arial") +
+  scale_fill_npg() + 
+  labs(x = "scRNA Sample", y = "Proportion of Cells", fill = "Genotype Cluster")
+```   
+   
+According to souporcell authors, this is not unexpected. Predictions for single-donor samples are very weak, more or less just chance. This is very few cells, so just for confirmation of hypotheses at best.   
+   
+### Assign cells, remove genotype-defined doublets      
+```{r}
+sc224_assignments = read.delim("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/souporcell/SC224/clusters.tsv")
+
+#remove doublets
+sc224_doublets = sc224_assignments %>% 
+  dplyr::filter(status != "singlet") %>% 
+  .$barcode %>% 
+  paste0("SC224_", .)
+safe = !(colnames(deepseq) %in% sc224_doublets)
+deepseq = deepseq[, safe]
+
+#rename samples
+a2161 = sc224_assignments %>% 
+  dplyr::filter(assignment == 1) %>% 
+  .$barcode %>% 
+  paste0("SC224_", .)
+a2164 = sc224_assignments %>% 
+  dplyr::filter(assignment == 0) %>% 
+  .$barcode %>% 
+  paste0("SC224_", .)
+deepseq = deepseq %>% 
+  mutate(barcode = colnames(deepseq),
+         sample = as.character(sample)) %>% 
+  #remove unclassified cells
+  dplyr::filter(sample != XXXXX | (barcode %in% c(a2161, a2164))) %>%  
+  mutate(sample = factor(case_when(barcode %in% a2161 ~ XXXXX,
+                                   barcode %in% a2164 ~ XXXXX,
+                                   TRUE ~ sample)))
+
+table(deepseq$sample, useNA = "always")
+```
+   
+### Remove XXXXX  
+   
+Far too few for any meaningful comparison   
+   
+```{r}
+deepseq = deepseq %>% 
+  dplyr::filter(sample != XXXXX) %>% 
+  #refactor
+  dplyr::mutate(sample = factor(as.character(sample)))
+
+table(deepseq$sample)
+```
+      
+# Doublet calling (scrublet)      
+## Batch 1   
+### Snakefile   
+   
+~/aging_microglia_flu/230109_Snakefile_scrublet
+   
+```{python eval=FALSE}
+import scrublet as scr
+import scipy.io
+import os
+import gzip
+import pandas as pd
+import matplotlib.pyplot as plt
+import subprocess
+
+EXPECTED_DOUBLET_RATE = {
+  "SC224": 0.016,
+  "SC225": 0.061,
+  "SC233": 0.039,
+  "SC234": 0.08,
+  "SC238": 0.061,
+  "SC239": 0.039,
+  "SC240": 0.08,
+  "SC250": 0.10,
+  "SC294": 0.016,
+  "SC295": 0.061
+  }
+#Automatic detection is useless
+CUTOFFS = {
+  "SC224": 0.20,
+  "SC225": 0.22,
+  "SC233": 0.23,
+  "SC234": 0.3,
+  "SC238": 0.23,
+  "SC239": 0.21,
+  "SC240": 0.28,
+  "SC250": 0.32,
+  "SC294": 0.20,
+  "SC295": 0.23
+  }
+
+rule all:
+  input:
+    expand("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/scrublet/{sample}_doublets.csv", sample=["SC224", "SC225", "SC233", "SC234", "SC238", "SC239", "SC240", "SC250", "SC294", "SC295"]),
+    expand("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/scrublet/{sample}_threshold.txt", sample=["SC224", "SC225", "SC233", "SC234", "SC238", "SC239", "SC240", "SC250", "SC294", "SC295"]),
+    expand("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/scrublet/{sample}_histogram.pdf", sample=["SC224", "SC225", "SC233", "SC234", "SC238", "SC239", "SC240", "SC250", "SC294", "SC295"]),
+    expand("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/scrublet/{sample}_umap.pdf", sample=["SC224", "SC225", "SC233", "SC234", "SC238", "SC239", "SC240", "SC250", "SC294", "SC295"])
+
+rule scrublet:
+  input:
+    "/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/cellranger/{sample}/outs/filtered_feature_bc_matrix/matrix.mtx.gz",
+    "/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/cellranger/{sample}/outs/filtered_feature_bc_matrix/barcodes.tsv.gz"
+  output:
+    "/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/scrublet/{sample}_doublets.csv",
+    "/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/scrublet/{sample}_threshold.txt",
+    "/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/scrublet/{sample}_histogram.pdf",
+    "/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/scrublet/{sample}_umap.pdf"
+    
+  params:
+    slurm__hours=1,
+    slurm__cores=1,
+    slurm__mem=8,
+    edr = lambda wildcards, input: EXPECTED_DOUBLET_RATE.get(wildcards.sample),
+    cutoff = lambda wildcards, input: CUTOFFS.get(wildcards.sample)
+  run:
+    subprocess.run("module load gcc/11.2.0", shell=True)
+    counts_matrix = scipy.io.mmread(gzip.open(input[0])).T.tocsc()
+    barcodes = pd.read_table(gzip.open(input[1]), header=None)
+    scrub = scr.Scrublet(counts_matrix, expected_doublet_rate = params.edr)
+    doublet_scores, doublets = scrub.scrub_doublets(min_counts=2,
+                                                    min_cells=3,
+                                                    min_gene_variability_pctl=85,
+                                                    n_prin_comps=30)
+    
+    #just go with manual
+    scrub.call_doublets(threshold = params.cutoff)
+    
+    #output doublet scores
+    barcodes['doublet'] = doublet_scores
+    barcodes.to_csv(output[0])
+    
+    #output cutoffs (not important now that we did manually)
+    if not os.path.exists(output[1]):
+        with open(output[1], 'w') as f:
+            f.write(str(scrub.threshold_))
+            
+    #output theshold plot
+    scrub.plot_histogram()
+    plt.savefig(output[2])
+    
+    #output UMAP plot
+    scrub.set_embedding('UMAP', scr.get_umap(scrub.manifold_obs_, n_neighbors=10, min_dist=0.2, metric='cosine'))
+    scrub.plot_embedding('UMAP', order_points=True)
+    plt.savefig(output[3])
+```
+   
+## Run pipe   
+```{bash eval=FALSE}
+cd /projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq
+screen
+source /projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/human_microglia_venv/bin/activate
+module purge all
+module load gcc/11.2.0 #required for annoy
+snakemake -s ~/aging_microglia_flu/230109_Snakefile_scrublet \
+--cluster-config '/home/rag0151/.slurm.json' \
+--cluster /projects/b1038/tools/snakemake/cluster.py \
+-j 1000 \
+-F \
+-n
+
+snakemake -s ~/aging_microglia_flu/230109_Snakefile_scrublet \
+--cluster-config '/home/rag0151/.slurm.json' \
+--cluster /projects/b1038/tools/snakemake/cluster.py \
+-j 1000 \
+-F
+```   
+   
+Note: as expected for a fairly homogeneous set of cells, scrublet automatic threshold detection was fairly useless, and failed entirely for SC250. We will have to repeat manually. This worked well.   
+   
+## Remove putative doublets   
+### Gather scrublet data   
+```{r}
+dub_files = list.files("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/scrublet",
+                       pattern = "_doublets.csv",
+                       full.names = T)
+names(dub_files) = basename(dub_files) %>% 
+  substring(1, 5)
+
+threshold_files = list.files("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final/scrublet/",
+                       pattern = "_threshold.txt",
+                       full.names = T)
+names(threshold_files) = basename(threshold_files) %>% 
+  substring(1, 5)
+all(names(dub_files) == names(threshold_files)) #TRUE
+
+doublets = vector(mode = "list", length = length(dub_files))
+for(i in 1:length(dub_files))
+{
+  sample = names(dub_files)[i]
+  threshold = suppressWarnings(readLines(threshold_files[i])) %>% 
+    as.numeric()
+  dubs = read_csv(dub_files[i], 
+                  skip = 1,
+                  col_names = c("row", "barcode", "doublet_score"),
+                  show_col_types = F) %>% 
+    dplyr::select(-row) %>% 
+    dplyr::mutate(barcode = paste(sample, barcode, sep = "_")) %>% 
+    dplyr::filter(doublet_score >= threshold) %>% 
+    .$barcode
+  doublets[[i]] = dubs
+}
+names(doublets) = names(dub_files)
+
+#ensure doublets are detected in all
+dub_counts = vapply(doublets, length, 1)
+names(dub_counts) = names(doublets)
+dub_counts
+  
+doublets = unlist(doublets)
+```
+   
+### Annotate dataset   
+```{r}
+deepseq = deepseq %>% 
+  dplyr::mutate(is_doublet = barcode %in% doublets)
+table(deepseq$is_doublet)
+```   
+Numbers are reasonable!   
+   
+### Remove doublet cells   
+```{r}
+deepseq = deepseq %>% 
+  tidyseurat::filter(is_doublet == FALSE)
+dim(deepseq)
+```   
+   
+# Integration      
+## SCT Normalization   
+```{r}
+deepseq = SCTransform(deepseq, 
+                      method = "glmGamPoi",
+                      seed.use = 12345,
+                      return.only.var.genes = T)
+```   
+   
+## Integration   
+### Export dataset   
+```{r eval=FALSE}
+saveRDS(deepseq, "/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/analysis/230110_pre_integration.rds")
+```
+
+### Run SCVI   
+   
+~/aging_microglia_flu/230110_human_microglia_flu_SCVI_integration.sh

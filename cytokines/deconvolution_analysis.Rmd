@@ -1,0 +1,703 @@
+---
+title: "Cytokine 'deconvolution' analysis"
+output: html_notebook
+---
+   
+# Setup   
+## Load packages   
+```{r}
+library(tidyverse)
+library(ComplexHeatmap)
+library(janitor)
+library(viridis)
+library(ggrepel)
+library(ggsci)
+library(Cairo)
+library(circlize)
+library(ggsignif)
+
+pal = pal_npg("nrc")(9)
+set.seed(666)
+pal_long = sample(colorRampPalette(pal_npg("nrc")(9))(28))
+set.seed(666)
+pal_medium = sample(colorRampPalette(pal_npg("nrc")(9))(16))
+```
+   
+## Import mean expression data   
+### scRNA   
+```{r}
+gene_conv = data.frame(gene = c("CCL21", "CXCL13", "CCL27", "EGF", "CXCL5",
+                                "CCL11", "CCL24", "CCL26", "FGF2", "FLT3LG",
+                                "CX3CL1", "CSF3", "CSF2", "CXCL1", "CCL1",
+                                "IFNA2", "IFNG", "IL10", "IL13", "IL15",
+                                "IL16", "IL17A", "IL1A", "IL1B", "IL1RN",
+                                "IL2", "IL20", "IL21", "IL23", "IFNL2",
+                                "IL3", "IL33", "IL4", "IL5", "IL6",
+                                "IL7", "IL8", "IL9", "CXCL10", "LIF",
+                                "CCL2", "CCL8", "CCL7", "CCL13", "CCL22",
+                                "CCL3", "CCL4", "CCL15", "CD40LG", "KITLG",
+                                "CXCL12", "CCL17", "TGFA", "TNF", "LTA",
+                                "THPO", "TNFSF10", "TSLP", "VEGFA"),
+                       display_name = c("CCL21", "CXCL13", "CCL27", "EGF", "CXCL5", "CCL11",
+                                        "CCL24", "CCL26", "FGF-2", "FLT-3L", "CX3CL1",
+                                        "CSF3", "CSF2", "CXCL1", "CCL1", "IFNa2",
+                                        "IFNg", "IL-10", "IL-13", "IL-15", "IL-16",
+                                        "IL-17A", "IL-1a", "IL-1b", "IL1RN", "IL-2",
+                                        "IL-20", "IL-21", "IL-23", "IFNL2", "IL-3",
+                                        "IL-33", "IL-4", "IL-5", "IL-6", "IL-7",
+                                        "IL-8", "IL-9", "CXCL10", "LIF", "CCL2",
+                                        "CCL8", "CCL7", "CCL13", "CCL22", "CCL3",
+                                        "CCL4", "CCL15", "sCD40L", "SCF", "CXCL12",
+                                        "CCL17", "TGFa", "TNFa", "LTA", "TPO",
+                                        "TRAIL", "TSLP", "VEGF-A"))
+
+#NOTE: these CSVs are COVID, only!
+celltypes = read.csv("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/230125_celltype_expression.csv") %>%
+  dplyr::rename(celltype = Celltype) %>% 
+  dplyr::filter(celltype != "Mixed Myeloid") %>% #meaningless
+  pivot_longer(cols = -celltype, names_to = "gene", values_to = "log_rna_expression")
+
+typestates = read.csv("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/230125_subcluster_expression.csv") %>%
+  dplyr::rename(cluster = Cluster) %>% 
+  dplyr::filter(cluster != "Mixed myeloid") %>% #meaningless
+  pivot_longer(cols = -cluster, names_to = "gene", values_to = "log_rna_expression")
+```   
+   
+Add undetected genes as zeros   
+```{r}
+gene_conv = data.frame(gene = c("CCL21", "CXCL13", "CCL27", "EGF", "CXCL5",
+                                "CCL11", "CCL24", "CCL26", "FGF2", "FLT3LG",
+                                "CX3CL1", "CSF3", "CSF2", "CXCL1", "CCL1",
+                                "IFNA2", "IFNG", "IL10", "IL13", "IL15",
+                                "IL16", "IL17A", "IL1A", "IL1B", "IL1RN",
+                                "IL2", "IL20", "IL21", "IL23", "IFNL2",
+                                "IL3", "IL33", "IL4", "IL5", "IL6",
+                                "IL7", "IL8", "IL9", "CXCL10", "LIF",
+                                "CCL2", "CCL8", "CCL7", "CCL13", "CCL22",
+                                "CCL3", "CCL4", "CCL15", "CD40LG", "KITLG",
+                                "CXCL12", "CCL17", "TGFA", "TNF", "LTA",
+                                "THPO", "TNFSF10", "TSLP", "VEGFA"),
+                       display_name = c("CCL21", "CXCL13", "CCL27", "EGF", "CXCL5", "CCL11",
+                                        "CCL24", "CCL26", "FGF-2", "FLT-3L", "CX3CL1",
+                                        "CSF3", "CSF2", "CXCL1", "CCL1", "IFNa2",
+                                        "IFNg", "IL-10", "IL-13", "IL-15", "IL-16",
+                                        "IL-17A", "IL-1a", "IL-1b", "IL1RN", "IL-2",
+                                        "IL-20", "IL-21", "IL-23", "IFNL2", "IL-3",
+                                        "IL-33", "IL-4", "IL-5", "IL-6", "IL-7",
+                                        "IL-8", "IL-9", "CXCL10", "LIF", "CCL2",
+                                        "CCL8", "CCL7", "CCL13", "CCL22", "CCL3",
+                                        "CCL4", "CCL15", "sCD40L", "SCF", "CXCL12",
+                                        "CCL17", "TGFa", "TNFa", "LTA", "TPO",
+                                        "TRAIL", "TSLP", "VEGF-A"))
+
+# generate dataframes with zeros for each filtered gene for all cell types, states
+undetected_genes = gene_conv %>% 
+  dplyr::filter(!(gene %in% celltypes$gene)) %>% 
+  .$gene
+
+# celltypes
+all_celltypes = unique(celltypes$celltype)
+celltypes_zeros = data.frame(celltype = rep(all_celltypes, each = length(undetected_genes)),
+                             gene = rep(undetected_genes, length(all_celltypes)),
+                             log_rna_expression = 0)
+celltypes = bind_rows(celltypes, celltypes_zeros) %>% 
+  left_join(., gene_conv)
+
+# typestates
+all_typestates = unique(typestates$cluster)
+typestates_zeros = data.frame(cluster = rep(all_typestates, each = length(undetected_genes)),
+                             gene = rep(undetected_genes, length(all_typestates)),
+                             log_rna_expression = 0)
+typestates = bind_rows(typestates, typestates_zeros) %>% 
+  left_join(., gene_conv)
+```
+   
+### Cytokines (summarized, COVID only)   
+```{r}
+covid_cytokines = readRDS("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/230308_5PL_fit_data_complete.rds") %>% 
+  dplyr::filter(diagnosis == "COVID-19") %>% 
+  group_by(display_name) %>% 
+  dplyr::summarize(protein_expression = mean(mean_concentration, na.rm = T),
+                   log_protein_expression = log10(protein_expression))
+```
+   
+### Import metadata conversion   
+```{r}
+script_md = readRDS("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/230308_5PL_fit_data_complete.rds") %>% 
+  dplyr::select(study_id, tc_pt_study_id, diagnosis, Superinfection) %>% 
+  unique()
+```
+
+   
+# Heatmaps of expression   
+## Cell type   
+```{r}
+#generate scaled matrix
+celltype_mat = celltypes %>% 
+  pivot_wider(id_cols = display_name, names_from = celltype, values_from = log_rna_expression) %>% 
+  column_to_rownames("display_name") %>% 
+  data.matrix()
+
+celltype_hm = 
+  Heatmap(matrix = celltype_mat,
+        name = "Log-Normalized Expression",
+        cluster_rows = T,
+        cluster_columns = T,
+        clustering_distance_rows = "euclidean",
+        clustering_distance_columns = "euclidean",
+        clustering_method_columns = "ward.D2",
+        clustering_method_rows = "ward.D2",
+        show_column_names = T, 
+        col = inferno(100),
+        column_names_rot = 45)
+
+CairoPDF("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/221111_celltype_deconv_hm.pdf",
+    width = 12,
+    height = 10, 
+    family = "Arial")
+celltype_hm
+dev.off()
+CairoPNG("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/221111_celltype_deconv_hm.png",
+    width = 12,
+    height = 10, 
+    units = "in",
+    res = 300,
+    family = "Arial")
+celltype_hm
+dev.off()
+
+celltype_hm
+```
+   
+## Type and state   
+```{r}
+#generate scaled matrix
+typestate_mat = typestates %>% 
+  pivot_wider(id_cols = display_name, names_from = cluster, values_from = log_rna_expression) %>% 
+  column_to_rownames("display_name") %>% 
+  data.matrix()
+
+typestate_hm = 
+  Heatmap(matrix = typestate_mat,
+        name = "Log-Normalized Expression",
+        cluster_rows = T,
+        cluster_columns = T,
+        clustering_distance_rows = "euclidean",
+        clustering_distance_columns = "euclidean",
+        clustering_method_columns = "ward.D2",
+        clustering_method_rows = "ward.D2",
+        show_column_names = T, 
+        col = inferno(100),
+        column_names_rot = 45)
+
+CairoPDF("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/221111_typestate_deconv_hm.pdf",
+    width = 12,
+    height = 10, 
+    family = "Arial")
+typestate_hm
+dev.off()
+CairoPNG("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/221111_typestate_deconv_hm.png",
+    width = 12,
+    height = 10, 
+    units = "in",
+    res = 300,
+    family = "Arial")
+typestate_hm
+dev.off()
+
+typestate_hm
+```   
+   
+# Relative contributions   
+## Bin by log expression   
+   
+### Determine cutoffs   
+```{r}
+range(celltypes$log_rna_expression)
+range(typestates$log_rna_expression)
+```   
+   
+0 --> No contribution   
+(0 - 1] --> Minor contributor   
+(1 - 2] --> Mmoderate contributor   
+(2 - Inf] --> Major contributor   
+   
+### By cell type   
+```{r}
+celltype_contributions = celltypes %>% 
+  dplyr::mutate(contribution = case_when(log_rna_expression == 0 ~ "No contribution",
+                                         log_rna_expression > 0 & log_rna_expression <= 1 ~ "Minor contributor",
+                                         log_rna_expression > 1 & log_rna_expression <= 2 ~ "Moderate contributor",
+                                         log_rna_expression > 2 ~ "Major contributor"),
+                rna_expression = 10 ^ log_rna_expression) %>% 
+  left_join(., covid_cytokines)
+
+celltype_contribution_scatterplot = celltype_contributions %>% 
+  ggplot(aes(x = reorder(display_name, -protein_expression), y = rna_expression)) +
+  geom_col(aes(y = protein_expression), 
+           position = "dodge", alpha = 0.01) +
+  geom_point(alpha = 0.7, aes(color = contribution)) +
+  geom_text_repel(data = subset(celltype_contributions, log_rna_expression > 0), 
+                  aes(label = celltype, color = contribution), 
+                  seed = 12345, min.segment.length = 0) +
+  theme_bw() +
+  scale_color_npg() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  labs(x = "Analyte", y = "Log-Normalized Expression") +
+  scale_y_log10()
+
+CairoPDF("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/221111_celltype_contributions_scatter.pdf",
+    width = 12,
+    height = 8, 
+    family = "Arial")
+celltype_contribution_scatterplot
+dev.off()
+CairoPNG("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/221111_celltype_contributions_scatter.png",
+    width = 12,
+    height = 8, 
+    units = "in",
+    res = 300,
+    family = "Arial")
+celltype_contribution_scatterplot
+dev.off()
+
+celltype_contribution_scatterplot
+```
+   
+Ben's alt version (stacked bar plots for scRNA)   
+```{r}
+celltype_contribution_barplot = celltype_contributions %>% 
+  group_by(display_name) %>% 
+  dplyr::filter(mean(log_rna_expression, na.rm = T) > 0) %>% 
+  dplyr::mutate(moam_contribution = cur_data()$rna_expression[cur_data()$celltype == "MoAM"] /
+                  sum(rna_expression, na.rm = T)) %>% 
+  ggplot(aes(x = reorder(display_name, -moam_contribution), 
+             y = rna_expression, group = rna_expression)) +
+  geom_col(aes(fill = celltype), position = "fill") +
+  theme_bw() +
+  scale_fill_manual(values = pal_medium) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  labs(x = "Analyte", y = "Proportion of scRNA Counts")
+
+CairoPNG("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/221117_celltype_stacked_rna.png",
+    width = 14,
+    height = 8, 
+    units = "in",
+    res = 300,
+    family = "Arial")
+celltype_contribution_barplot
+dev.off()
+
+celltype_contribution_barplot
+```
+   
+### By type and state   
+```{r}
+typestate_contributions = typestates %>% 
+  dplyr::mutate(contribution = case_when(log_rna_expression == 0 ~ "No contribution",
+                                         log_rna_expression > 0 & log_rna_expression <= 1 ~ "Minor contributor",
+                                         log_rna_expression > 1 & log_rna_expression <= 2 ~ "Moderate contributor",
+                                         log_rna_expression > 2 ~ "Major contributor"),
+                rna_expression = 10 ^ log_rna_expression) %>% 
+  left_join(., covid_cytokines)
+
+typestate_contribution_scatterplot = typestate_contributions %>% 
+  ggplot(aes(x = reorder(display_name, -protein_expression), y = rna_expression)) +
+  geom_col(aes(y = protein_expression), 
+           position = "dodge", alpha = 0.005) +
+  geom_point(alpha = 0.7, aes(color = contribution)) +
+  geom_text_repel(data = subset(typestate_contributions, log_rna_expression > 0), 
+                  aes(label = cluster, color = contribution), 
+                  seed = 12345, min.segment.length = 0) +
+  theme_bw() +
+  scale_color_npg() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  labs(x = "Analyte", y = "Log-Normalized Expression") +
+  scale_y_log10()
+
+CairoPDF("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/221111_typestate_contributions_scatter.pdf",
+    width = 12,
+    height = 8, 
+    family = "Arial")
+typestate_contribution_scatterplot
+dev.off()
+CairoPNG("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/221111_typestate_contributions_scatter.png",
+    width = 12,
+    height = 8, 
+    units = "in",
+    res = 300,
+    family = "Arial")
+typestate_contribution_scatterplot
+dev.off()
+
+typestate_contribution_scatterplot
+```   
+   
+Ben's alt version (stacked bar plots for scRNA)   
+```{r}
+typestate_contribution_barplot = typestate_contributions %>% 
+  group_by(display_name) %>% 
+  dplyr::filter(mean(log_rna_expression, na.rm = T) > 0) %>% 
+  dplyr::mutate(moam2_contribution = sum(cur_data()$rna_expression[grepl("MoAM", cur_data()$cluster)], 
+                                         na.rm = T) /
+                  sum(rna_expression, na.rm = T)) %>% 
+  ggplot(aes(x = reorder(display_name, -moam2_contribution), 
+             y = rna_expression, group = rna_expression)) +
+  geom_col(aes(fill = cluster), position = "fill") +
+  theme_bw() +
+  scale_fill_manual(values = pal_long) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  labs(x = "Analyte", y = "Proportion of scRNA Counts")
+
+CairoPNG("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/221117_typestate_stacked_rna.png",
+    width = 16,
+    height = 8, 
+    units = "in",
+    res = 300,
+    family = "Arial")
+typestate_contribution_barplot
+dev.off()
+
+typestate_contribution_barplot
+```
+
+   
+# Direct correlation   
+## By celltype   
+### Organize data   
+```{r}
+sample_conv = read_csv("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/script-to-sc-patient.csv",
+                       col_names = c("tc_pt_study_id", "Patient"))
+complete_cytokines = readRDS("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/230308_5PL_fit_data_complete.rds") %>% 
+  dplyr::filter(sample_origin == "BAL") %>% 
+  dplyr::select(tc_pt_study_id, display_name, 
+                protein_expression = mean_concentration, diagnosis) %>% 
+  dplyr::mutate(protein_expression = protein_expression,
+                log_protein_expression = log10(protein_expression + 1))
+
+#includes non-COVID!
+celltype_cor_data = read.csv("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/230125_celltype_expression_patient.csv") %>% 
+  dplyr::filter(Celltype != "Mixed Myeloid") %>% #meaningless
+  left_join(., sample_conv) %>% 
+  dplyr::select(-Patient) %>% 
+  pivot_longer(cols = -c(Celltype, tc_pt_study_id),
+               names_to = "gene",
+               values_to = "log_rna_expression") %>% 
+  dplyr::mutate(rna_expression = 10 ^ log_rna_expression) %>% 
+  left_join(gene_conv) %>% 
+  left_join(., complete_cytokines)
+```   
+   
+### Run correlations   
+```{r}
+celltype_cors = celltype_cor_data %>% 
+  group_by(display_name, Celltype) %>% 
+  dplyr::summarize(pearson_r = tryCatch(cor.test(rna_expression, protein_expression,
+                                                 method = "pearson")$estimate,
+                                        error = function(cond){
+                                          return(NA_real_) }),
+                   pearson_pval = tryCatch(cor.test(rna_expression, protein_expression, 
+                                                    method = "pearson")$p.value,
+                                           error = function(cond){
+                                             return(NA_real_) }),
+                   spearman_rho = tryCatch(cor.test(rna_expression, protein_expression, 
+                                                  method = "spearman", exact = T)$estimate,
+                                         error = function(cond){
+                                           return(NA_real_) }),
+                   spearman_pval = tryCatch(cor.test(rna_expression, protein_expression, 
+                                                     method = "spearman", exact = T)$p.value,
+                                            error = function(cond){
+                                              return(NA_real_) })) %>% 
+  suppressWarnings() %>% 
+  dplyr::mutate(pearson_padj = p.adjust(pearson_pval, method = "fdr"),
+                spearman_padj = p.adjust(spearman_pval, method = "fdr")) %>% 
+  ungroup() %>% 
+  group_by(display_name) %>% 
+  dplyr::filter(any(!is.na(pearson_r)) & any(!is.na(spearman_rho))) %>% 
+  ungroup()
+```
+   
+### Corplot   
+```{r}
+celltype_cor_mat = celltype_cors %>% 
+  dplyr::mutate(spearman_rho = ifelse(is.na(spearman_rho),
+                                   yes = 0,
+                                   no = spearman_rho)) %>% 
+  pivot_wider(id_cols = Celltype, names_from = display_name, values_from = spearman_rho) %>% 
+  column_to_rownames("Celltype") %>% 
+  data.matrix()
+celltype_pval_mat = celltype_cors %>% 
+  pivot_wider(id_cols = Celltype, names_from = display_name, values_from = spearman_padj) %>% 
+  column_to_rownames("Celltype") %>% 
+  data.matrix()
+
+color_fun = colorRamp2(c(-1, 0, 1), c("blue", "white", "red"))
+
+celltype_cor_hm = 
+  Heatmap(matrix = celltype_cor_mat,
+        name = "Spearman rho",
+        cluster_rows = T,
+        cluster_columns = T,
+        clustering_distance_rows = "euclidean",
+        clustering_distance_columns = "euclidean",
+        clustering_method_columns = "ward.D2",
+        clustering_method_rows = "ward.D2",
+        show_column_names = T,
+        col = color_fun,
+        cell_fun = function(j, i, x, y, w, h, fill) {
+          if(is.na(celltype_pval_mat[i, j]))
+          {
+            grid.text("X", x, y)
+          } else if(celltype_pval_mat[i, j] < 0.05){
+            grid.text("*", x, y)
+          }
+        },
+        column_names_rot = 45)
+
+CairoPNG("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/221117_celltype_corrplot.png",
+    width = 16,
+    height = 8, 
+    units = "in",
+    res = 300,
+    family = "Arial")
+celltype_cor_hm
+dev.off()
+
+celltype_cor_hm
+```
+   
+## By cluster   
+### Organize data   
+```{r}
+#includes non-COVID!
+cluster_cor_data = read.csv("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/230125_subcluster_expression_patient.csv") %>% 
+  dplyr::filter(Cluster != "Mixed myeloid") %>% #meaningless
+  left_join(., sample_conv) %>% 
+  dplyr::select(-Patient) %>% 
+  pivot_longer(cols = -c(Cluster, tc_pt_study_id),
+               names_to = "gene",
+               values_to = "log_rna_expression") %>% 
+  dplyr::mutate(rna_expression = 10 ^ log_rna_expression) %>% 
+  left_join(gene_conv) %>% 
+  left_join(., complete_cytokines)
+```   
+   
+### Run correlations   
+```{r}
+cluster_cors = cluster_cor_data %>% 
+  group_by(display_name, Cluster) %>% 
+  dplyr::summarize(pearson_r = tryCatch(cor.test(rna_expression, protein_expression,
+                                                 method = "pearson")$estimate,
+                                        error = function(cond){
+                                          return(NA_real_) }),
+                   pearson_pval = tryCatch(cor.test(rna_expression, protein_expression, 
+                                                    method = "pearson")$p.value,
+                                           error = function(cond){
+                                             return(NA_real_) }),
+                   spearman_rho = tryCatch(cor.test(rna_expression, protein_expression, 
+                                                  method = "spearman", exact = T)$estimate,
+                                         error = function(cond){
+                                           return(NA_real_) }),
+                   spearman_pval = tryCatch(cor.test(rna_expression, protein_expression, 
+                                                     method = "spearman", exact = T)$p.value,
+                                            error = function(cond){
+                                              return(NA_real_) })) %>% 
+  suppressWarnings() %>% 
+  dplyr::mutate(pearson_padj = p.adjust(pearson_pval, method = "fdr"),
+                spearman_padj = p.adjust(spearman_pval, method = "fdr")) %>% 
+  ungroup() %>% 
+  group_by(display_name) %>% 
+  dplyr::filter(any(!is.na(pearson_r)) & any(!is.na(spearman_rho))) %>% 
+  ungroup()
+```
+   
+### Corplot   
+```{r}
+cluster_cor_mat = cluster_cors %>% 
+  dplyr::mutate(spearman_rho = ifelse(is.na(spearman_rho),
+                                   yes = 0,
+                                   no = spearman_rho)) %>% 
+  pivot_wider(id_cols = Cluster, names_from = display_name, values_from = spearman_rho) %>% 
+  column_to_rownames("Cluster") %>% 
+  data.matrix()
+cluster_pval_mat = cluster_cors %>% 
+  pivot_wider(id_cols = Cluster, names_from = display_name, values_from = spearman_padj) %>% 
+  column_to_rownames("Cluster") %>% 
+  data.matrix()
+
+color_fun = colorRamp2(c(-1, 0, 1), c("blue", "white", "red"))
+
+cluster_cor_hm = 
+  Heatmap(matrix = cluster_cor_mat,
+        name = "Spearman rho",
+        cluster_rows = T,
+        cluster_columns = T,
+        clustering_distance_rows = "euclidean",
+        clustering_distance_columns = "euclidean",
+        clustering_method_columns = "ward.D2",
+        clustering_method_rows = "ward.D2",
+        show_column_names = T,
+        col = color_fun,
+        cell_fun = function(j, i, x, y, w, h, fill) {
+          if(is.na(cluster_pval_mat[i, j]))
+          {
+            grid.text("X", x, y)
+          } else if(cluster_pval_mat[i, j] < 0.05){
+            grid.text("*", x, y)
+          }
+        },
+        column_names_rot = 45)
+
+CairoPNG("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/221117_cluster_corrplot.png",
+    width = 16,
+    height = 8, 
+    units = "in",
+    res = 300,
+    family = "Arial")
+cluster_cor_hm
+dev.off()
+
+cluster_cor_hm
+```   
+   
+# Bar/dot plots with error bars, split by disease state   
+### By cell type   
+```{r}
+protein_means = celltype_cor_data %>% 
+  dplyr::filter(!is.na(diagnosis)) %>% 
+  group_by(display_name) %>% 
+  dplyr::mutate(mean_protein_covid = mean(subset(cur_data(), 
+                                                 diagnosis == "COVID-19")$protein_expression, 
+                                          na.rm = T)) %>% 
+  ungroup() %>% 
+  group_by(display_name, diagnosis, mean_protein_covid) %>% 
+  dplyr::summarize(mean_protein = mean(protein_expression, na.rm = T)) %>% 
+  ungroup()
+
+celltype_contribution_scatterplot_patient = celltype_cor_data %>% 
+  dplyr::filter(!is.na(diagnosis)) %>% 
+  dplyr::mutate(is_moam = factor(Celltype == "MoAM")) %>% 
+  group_by(display_name) %>% 
+  dplyr::mutate(mean_protein_covid = mean(subset(cur_data(), 
+                                                 diagnosis == "COVID-19")$protein_expression, 
+                                          na.rm = T)) %>% 
+  ungroup() %>% 
+  ggplot(aes(x = reorder(display_name, -mean_protein_covid), y = rna_expression)) +
+  facet_wrap(~diagnosis, ncol = 1) +
+  geom_bar(data = protein_means, aes(y = mean_protein, fill = diagnosis), stat = "identity", alpha = 0.7) +
+  stat_summary(aes(group = Celltype, shape = is_moam), geom = "point", fun = "mean") +
+  stat_summary(aes(group = Celltype, label = Celltype), 
+               geom = "text_repel", fun = "mean", min.segment.length = 0,
+               size = 6, max.overlaps = 10) +
+  theme_bw() +
+  scale_fill_npg() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 24),
+        axis.text.y = element_text(size = 24),
+        axis.title.x = element_text(size = 36),
+        axis.title.y = element_text(size = 36),
+         strip.text = element_text(size = 24)) +
+  labs(x = "Analyte", y = "Log-Normalized Expression") +
+  scale_y_log10()
+
+CairoPDF("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/230125_celltype_contributions_scatter_patient.pdf",
+    width = 12,
+    height = 12, 
+    family = "Arial")
+celltype_contribution_scatterplot_patient
+dev.off()
+CairoPNG("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/230125_celltype_contributions_scatter_patient.png",
+    width = 12,
+    height = 12, 
+    units = "in",
+    res = 300,
+    family = "Arial")
+celltype_contribution_scatterplot_patient
+dev.off()
+
+saveRDS(celltype_contribution_scatterplot_patient, "~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/230125_celltype_contributions_scatter_patient.rds")
+
+celltype_contribution_scatterplot_patient
+```
+      
+# Are lung cytokine concentrations consistently higher than plasma?   
+## Organize data   
+```{r}
+source_data_wide = readRDS("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/230308_5PL_fit_data_complete.rds") %>% 
+  dplyr::filter(diagnosis == "COVID-19") %>% 
+  dplyr::select(tc_pt_study_id, study_id, sample_origin, 
+                display_name, mean_concentration) %>% 
+  dplyr::mutate(sample_origin = factor(case_when(sample_origin == "SERUM" ~ "Plasma",
+                                                 sample_origin == "BAL" ~ "BAL"))) %>% 
+  pivot_wider(names_from = sample_origin,
+              values_from = mean_concentration) %>% 
+  #keep only paired data
+  dplyr::filter(!is.na(BAL) & !is.na(Plasma))
+
+source_data_long = source_data_wide %>% 
+  pivot_longer(cols = c(BAL, Plasma),
+               names_to = "sample_origin",
+               values_to = "mean_concentration")
+```   
+   
+## Run paired stats
+```{r}
+paired_pvals = source_data_wide %>% 
+  group_by(display_name) %>% 
+  dplyr::summarize(pval = wilcox.test(x = cur_data()$BAL,
+                                      y = cur_data()$Plasma,
+                                      paired = TRUE)$p.value,
+                   max_y = max(c(cur_data()$BAL, cur_data()$Plasma, na.rm = TRUE)),
+                   log2FoldChange = log2(mean(cur_data()$BAL, na.rm = TRUE) /
+                                           mean(cur_data()$Plasma, na.rm = TRUE))) %>% 
+  dplyr::mutate(padj = p.adjust(pval, method = "fdr"),
+                padj_formatted = format(padj, digits = 2, scientific = T),
+                yval = log10(max_y) + 0.3) %>% 
+  dplyr::filter(padj < 0.05) %>% 
+  dplyr::arrange(desc(log2FoldChange))
+
+write.csv(paired_pvals, "~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/230701_BAL_over_plasma.csv")
+
+paired_pvals_interest = paired_pvals %>% 
+  dplyr::filter(display_name %in% c("CXCL10", "CCL8", "CCL2",
+                                    "IL-6", "TNFa", "IL-1b"))
+```
+   
+## Plot key cytokines   
+```{r}
+paired_source_plot = source_data_long %>% 
+  dplyr::filter(display_name %in% c("CXCL10", "CCL8", "CCL2",
+                                    "IL-6", "TNFa", "IL-1b")) %>% 
+ggplot(aes(x = sample_origin, y = mean_concentration, fill = sample_origin)) +
+  geom_point() +
+  geom_boxplot(outlier.shape = NA) +
+  facet_wrap(~display_name, scales = "free_y") +
+  geom_line(aes(group = study_id), linetype = 2) +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(size = 24),
+        axis.text.y = element_text(size = 24),
+        axis.title.x = element_text(size = 36),
+        axis.title.y = element_text(size = 36),
+         strip.text = element_text(size = 24)) +
+  labs(x = "Sample Origin", y = "[Analyte] (pg/mL)") +
+  scale_fill_manual(values = c(pal[4], pal[5])) +
+  scale_y_continuous(trans = scales::pseudo_log_trans(base = 10), 
+                     breaks = c(1e0, 1e1, 1e2, 1e3, 1e4, 1e5),
+                     expand = expansion(mult = c(0, 0.15))) +
+  geom_signif(data = paired_pvals_interest,
+              aes(xmin = 1, xmax = 2, annotations = padj_formatted, y_position = yval),
+              inherit.aes = F,
+              tip_length = 0,
+              manual = T, textsize = 9)
+
+CairoPDF("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/230629_paired_source_plot.pdf",
+    width = 12,
+    height = 8, 
+    family = "Arial")
+paired_source_plot
+dev.off()
+saveRDS(paired_source_plot, "~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/230629_paired_source_plot.rds")
+
+paired_source_plot
+```

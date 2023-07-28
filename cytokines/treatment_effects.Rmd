@@ -1,0 +1,312 @@
+---
+title: "SCRIPT Cytokines Treatment effects"
+output: html_notebook
+---
+
+# Setup   
+# Load packages   
+```{r setup}
+library(tidyverse)
+library(ggplot2)
+library(ggsci)
+library(ggsignif)
+library(ggExtra)
+library(ComplexHeatmap)
+library(viridis)
+library(broom)
+library(Cairo)
+library(rstatix)
+library(ggrepel)
+
+#for LMM analysis
+library(lattice)   
+library(sjPlot)    
+library(ggeffects)
+library(lme4)     
+library(lmerTest)  
+library(report)    
+library(emmeans)
+library(broom.mixed)
+
+#for RNA-seq reanalysis   
+library(DESeq2)
+
+source("~/Documents/GitHub/utils/R/k_means_figure.R")
+source("~/Documents/GitHub/utils/R/pretty_MA_plot.R")
+source("~/Documents/GitHub/utils/R/plotPCA_manual.R")
+source("~/Documents/GitHub/utils/R/get_tidy_counts.R")
+source("~/Documents/GitHub/utils/R/go_enrichment.R")
+
+fig2_pal = pal_npg("nrc")(9)
+hardcoded_pal = c("Healthy Control" = fig2_pal[6],
+                  "Non-Pneumonia Control" = fig2_pal[2],
+                  "COVID-19" = fig2_pal[1],
+                  "Other Viral Pneumonia" = fig2_pal[3],
+                  "Other Pneumonia" = fig2_pal[4])
+```   
+   
+## Import data   
+### Treatment data   
+```{r}
+#updated 2022-08-16
+#add medication dates (steroids, anti-IL6, CRAC inhibitors, antivirals)
+medications = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/220816 SCRIPT Medication Administration.csv",
+                       check.names = T) %>% 
+  dplyr::rename(drug_type = catalog_type1,
+                drug = base_medication_name)  %>% 
+  dplyr::filter(!(drug_type %in% c("Antibiotics", "Antifungal")) &
+                  #remove placebo drugs
+                  !(drug %in% c("Oseltamivir", "Hydroxychloroquine", "Baloxavir", "Fludrocortisone"))) %>% 
+  dplyr::mutate(drug_type = ifelse(drug == "Remdesivir",
+                                   yes = "Remdesivir",
+                                   no = drug_type)) %>% 
+  dplyr::mutate(drug_type = factor(drug_type),
+                drug = factor(drug),
+                ir_id = as.character(ir_id),
+                administration_date = as.Date(administration_date, 
+                                              format = "%m/%e/%Y")) 
+
+medication_starts = medications %>% 
+  group_by(ir_id, drug_type) %>% 
+  dplyr::summarize(first_administration = min(administration_date)) %>% 
+  pivot_wider(names_from = drug_type, values_from = first_administration) %>% 
+  dplyr::rename(IL6_Block = `IL6 Block`)
+```   
+   
+### Cytokine data
+```{r}
+complete = readRDS("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/230518_5PL_fit_data_complete_with_steroids.rds") %>% 
+  dplyr::mutate(sample_origin = factor(case_when(sample_origin == "BAL" ~ "BAL",
+                                                 sample_origin == "SERUM" ~ "Plasma")),
+                combined = factor(paste(display_name, sample_origin, sep = ", "),
+                                  levels = paste(sort(unique(display_name)), 
+                                                 c(rep("BAL", length(unique(display_name))),
+                                                   rep("Plasma", length(unique(display_name)))),
+                                                 sep = ", ")),
+                study_id = case_when(is.na(study_id) & 
+                                       diagnosis == "Healthy Control" ~ tc_pt_study_id,
+                                     TRUE ~ study_id),
+                ir_id = case_when(is.na(ir_id) & 
+                                       diagnosis == "Healthy Control" ~ tc_pt_study_id,
+                                     TRUE ~ ir_id)) %>% 
+  #set so that ever sample after the first steroid treatment is flagged as treated
+  group_by(study_id) %>% 
+  dplyr::mutate(first_steroid_record_doi = min(day_of_intubation[after_steroids == TRUE],
+                                               na.rm = TRUE),
+                first_steroid_record_date = min(BAL_order_date[after_steroids == TRUE],
+                                               na.rm = TRUE),
+                after_steroids = case_when(after_steroids == TRUE ~ TRUE,
+                                           BAL_order_date > first_steroid_record_date ~ TRUE,
+                                           #these were manually edited; leave alone. Hours matter.
+                                           BAL_order_date == first_steroid_record_date ~ after_steroids,
+                                           #probably all false, but defer to manual edits
+                                           BAL_order_date < first_steroid_record_date ~ after_steroids,
+                                           TRUE ~ after_steroids)) %>% 
+  ungroup()
+
+complete_early = complete %>% 
+  dplyr::filter(diagnosis == "Healthy Control" | #healthy controls are never intubated
+                  (day_of_intubation >= 0 &
+                     day_of_intubation <= 2))
+```
+   
+# In bulk   
+## COVID Only   
+### DEA   
+```{r warning=FALSE}
+steroid_hits_covid = complete %>% 
+  dplyr::filter(diagnosis == "COVID-19" & BAL_order_date <= as.Date("2020-07-17")) %>% 
+  group_by(sample_origin, display_name, combined) %>% 
+  dplyr::summarize(pval = wilcox.test(mean_concentration ~ after_steroids, exact = T)$p.value,
+                   mean_before_steroids = mean(mean_concentration[after_steroids == FALSE], na.rm = T),
+                   mean_after_steroids = mean(mean_concentration[after_steroids == TRUE], na.rm = T),
+                   global_mean = mean(mean_concentration, na.rm = T),
+                   max_value = max(mean_concentration, na.rm = T)) %>% 
+  ungroup() %>% 
+  group_by(sample_origin) %>% #because these are separate assays, really
+  mutate(padj = p.adjust(pval, method = "fdr")) %>% 
+  ungroup() %>% 
+  #get rid of NS and biologically insignificant
+  dplyr::filter(padj < 0.05 &
+                  global_mean >= 10) %>% 
+  mutate(y = max_value,
+         ylog10 = log10(max_value) + 0.1,
+         padj_formatted = format(padj, digits = 3, scientific = T)) %>% 
+  dplyr::arrange(sample_origin, display_name)
+```   
+These are actually all COVID, so really only need to plot COVID   
+   
+### Plot hits   
+```{r}
+steroid_data_covid = complete %>% 
+  dplyr::filter(diagnosis == "COVID-19" & 
+                  combined %in% unique(steroid_hits_covid$combined) & 
+                  BAL_order_date <= as.Date("2020-07-17")) %>%
+  dplyr::arrange(sample_origin, display_name)
+
+steroid_hits_covid_plot = ggplot(steroid_data_covid, aes(x = after_steroids, y = mean_concentration, fill = after_steroids)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(size = 0.1, width = 0.3) +
+  facet_wrap(~  sample_origin + display_name, scales = "free_y", ncol = 7) +
+  scale_y_continuous(trans = scales::pseudo_log_trans(base = 10), 
+                     breaks = c(0, 1e1, 1e2, 1e3, 1e4, 1e5)) +
+  theme_bw(base_family = "Arial") +
+  labs(x = "After Steroid Treatment", y = "Mean Concentration (pg/mL)") +
+  scale_fill_manual(values = c("FALSE" = fig2_pal[6],
+                               "TRUE" = fig2_pal[7]),
+                    name = "After Steroids") +
+  geom_signif(data = steroid_hits_covid,
+              aes(xmin = FALSE, xmax = TRUE, annotations = padj_formatted, y_position = ylog10),
+              inherit.aes = F,
+              tip_length = 0,
+              manual = T)
+
+CairoPDF("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/220511_steroid_hits_covid.pdf",
+    width = 16,
+    height = 6,
+    family = "Arial")
+steroid_hits_covid_plot
+dev.off()
+
+CairoPNG("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/220511_steroid_hits_covid.png",
+    width = 16,
+    height = 6,
+    units = "in",
+    res = 300,
+    family = "Arial")
+steroid_hits_covid_plot
+dev.off()
+
+steroid_hits_covid_plot
+```   
+   
+## All groups   
+### DEA   
+```{r warning=FALSE}
+steroid_data_complete = complete %>% 
+  dplyr::filter(BAL_order_date <= as.Date("2020-07-17")) %>% 
+  dplyr::mutate(combined_group = factor(paste(diagnosis, after_steroids, sep = "_")))
+
+steroid_data_maxes = steroid_data_complete %>% 
+  group_by(sample_origin, display_name) %>% 
+  dplyr::summarize(max_y = max(mean_concentration, na.rm = T)) %>% 
+  ungroup()
+
+#break up by analyte and sample origin, perform pairwise wilcox tests across [analyte + steroid_treatment]
+#then subset to only relevant comparisons and perform FDR correction
+steroid_comps_complete = lapply(unique(steroid_data_complete$sample_origin), function(origin){
+  origin_sub = subset(steroid_data_complete, sample_origin == origin)
+  out = lapply(unique(origin_sub$display_name), function(ana){
+    analyte_sub = subset(origin_sub, display_name == ana)
+    comps = pairwise.wilcox.test(x = analyte_sub$mean_concentration, g = analyte_sub$combined_group, p.adjust.method = "none") %>% 
+      tidy() %>% 
+      dplyr::mutate(display_name = ana,
+                    sample_origin = origin)
+    return(comps) })
+  
+  out = bind_rows(out) %>% 
+    #relevant: same diagnosis ± steroids, different diagnosis, same steroid status
+    dplyr::mutate(diagnosis1 = substring(group1, 1, regexpr("_", group1) - 1),
+                  diagnosis2 = substring(group2, 1, regexpr("_", group2) - 1),
+                  steroids1 = substring(group1, regexpr("_", group1) + 1),
+                  steroids2 = substring(group2, regexpr("_", group2) + 1)) %>% 
+    dplyr::filter((diagnosis1 == diagnosis2) & (steroids1 != steroids2) |
+                    (diagnosis1 != diagnosis2) & (steroids1 == steroids2)) %>% 
+    #treat BAL and plasma as separate assays
+    dplyr::mutate(padj = p.adjust(p.value, method = "fdr"),
+                  padj_formatted = format(padj, digits = 2, scientific = T)) %>% 
+    dplyr::filter(padj < 0.05)
+  
+  return(out) }) %>% 
+  bind_rows() %>% 
+  #now add yvals
+  left_join(., steroid_data_maxes) %>% 
+  group_by(sample_origin, display_name) %>% 
+  dplyr::mutate(yval = seq(from = dplyr::first(max_y) * 1.1, by = dplyr::first(max_y) * 0.1, length.out = n()),
+                ylog10 = seq(from = log10(dplyr::first(max_y)) + 0.1, by = 0.15, length.out = n())) %>% 
+  ungroup() %>% 
+  dplyr::mutate(diagnosis1 = factor(diagnosis1, levels = c("COVID-19", "Non-Pneumonia Control",
+                                                   "Other Pneumonia", "Other Viral Pneumonia")),
+                diagnosis2 = factor(diagnosis2, levels = c("COVID-19", "Non-Pneumonia Control",
+                                                   "Other Pneumonia", "Other Viral Pneumonia")),
+                xmin = case_when(steroids1 == FALSE ~ as.numeric(diagnosis1) - 0.2,
+                                 steroids1 == TRUE ~ as.numeric(diagnosis1) + 0.2),
+                xmax = case_when(steroids2 == FALSE ~ as.numeric(diagnosis2) - 0.2,
+                                 steroids2 == TRUE ~ as.numeric(diagnosis2) + 0.2))
+```   
+These are actually all COVID, so really only need to plot COVID   
+   
+### Plot hits (only significant for COVID)      
+```{r}
+#subset to just COVID significant
+steroid_data_complete_plot = steroid_data_complete %>% 
+  dplyr::filter(combined %in% steroid_hits_covid$combined) %>% 
+  dplyr::mutate(treatment_status = factor(case_match(after_steroids,
+                                              TRUE ~ "After Steroid\nTreatment",
+                                              FALSE ~ "Before Steroid\nTreatment"),
+                                          levels = c("Before Steroid\nTreatment", "After Steroid\nTreatment"))) 
+
+steroid_comps_complete_plot = steroid_comps_complete %>% 
+  dplyr::mutate(combined = paste(display_name, sample_origin, sep = ", "),
+                #dumb hack to rescue repeated values
+                #see https://github.com/const-ae/ggsignif/issues/63
+                group = seq(from = 1, to = nrow(.))) %>% 
+  dplyr::filter(combined %in% steroid_hits_covid$combined)
+
+steroid_hits_plot = ggplot(steroid_data_complete_plot, aes(x = diagnosis, y = mean_concentration, fill = diagnosis,
+                                                           alpha = treatment_status)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.2), size = 0.1, seed = 12345) +
+  facet_wrap(~ sample_origin + display_name, scales = "free_y", ncol = 7) +
+  scale_y_continuous(trans = scales::pseudo_log_trans(base = 10), 
+                     breaks = c(0, 1e1, 1e2, 1e3, 1e4, 1e5)) +
+  theme_bw(base_family = "Arial") +
+  labs(x = "", y = "Mean Concentration (pg/mL)") +
+  scale_alpha_manual(values = c("Before Steroid\nTreatment" = 0.5,
+                               "After Steroid\nTreatment" = 1),
+                    name = "") +
+  scale_fill_manual(name = "Diagnosis",
+                    values = c("Healthy Control" = fig2_pal[6],
+                               "Non-Pneumonia Control" = fig2_pal[2],
+                               "COVID-19" = fig2_pal[1], 
+                               "Other Viral Pneumonia" = fig2_pal[3],
+                               "Other Pneumonia" = fig2_pal[4])) +
+  geom_signif(data = steroid_comps_complete_plot,
+              aes(xmin = xmin, xmax = xmax, annotations = padj_formatted, y_position = ylog10, group = group),
+              inherit.aes = F,
+              tip_length = 0,
+              manual = T,
+              textsize = 5) +
+  theme(legend.position = c(0.1, 0.8),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 24),
+        axis.text.y = element_text(size = 24),
+        axis.title.x = element_text(size = 36),
+        axis.title.y = element_text(size = 36),
+         strip.text = element_text(size = 24),
+        legend.text = element_text(size = 18),
+        legend.key.size = unit(1.5, 'cm'),
+        legend.background = element_blank()) +
+  guides(alpha=guide_legend(override.aes=list(fill=hcl(c(15,195),100,0,alpha=c(0.5,1)),
+                                              color=NA),
+                            nrow = 2)) +
+  guides(fill = FALSE)
+
+CairoPDF("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/230521_steroid_hits_complete.pdf",
+    width = 24,
+    height = 9,
+    family = "Arial")
+steroid_hits_plot
+dev.off()
+
+CairoPNG("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/230521_steroid_hits_complete.png",
+    width = 24,
+    height = 9,
+    units = "in",
+    res = 300,
+    family = "Arial")
+steroid_hits_plot
+dev.off()
+saveRDS(steroid_hits_plot, "~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/230521_steroid_hits_complete.rds")
+
+steroid_hits_plot
+```   

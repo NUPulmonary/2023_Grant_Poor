@@ -1,0 +1,2034 @@
+---
+title: "Cytokine data import and cleaning (final)"
+output:
+  html_document:
+    df_print: paged
+---
+
+# Setup   
+## Load packages   
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse, warn.conflicts = F)
+library(ggplot2)
+library(readxl)
+library(ComplexHeatmap)
+library(RColorBrewer)
+library(ggsci)
+library(ggrepel)
+library(Cairo)
+library(circlize)
+library(viridis)
+library(broom)
+library(ggsignif)
+library(ggpointdensity)
+library(ggalluvial)
+
+pal = pal_npg("nrc")(9)
+diagnosis_pal = c("Non-Pneumonia Control" = pal[2],
+              "COVID-19" = pal[1],
+              "Other Viral Pneumonia" = pal[3],
+              "Other Pneumonia" = pal[4],
+              "Healthy Control" = pal[6],
+              "Long COVID" = pal[5])
+superinfection_pal = c("Superinfection" = pal[9],
+                       "Primary Only" = pal[7])
+
+source("convert_evetech_names.R")
+source("luminex_manual_prediction.R")
+```
+   
+## Import data
+### Sample metadata
+```{r}
+md_bal_test = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/210902 SCRIPT -80C - EVETECH_BAL.csv", 
+                  nrows = 100) %>% #weird duplication of data for some reason
+  dplyr::filter(EveTech_BAL == TRUE) %>% 
+  dplyr::select(tc_pt_study_id = script_sample, evetech_id = SHIPPING.ID) %>% 
+  mutate(batch = "test_bal")
+
+md_serum_test = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/210902 SCRIPT -80C - EVETECH_PLASMA.csv", 
+                  nrows = 100) %>% #weird duplication of data for some reason
+  dplyr::filter(EveTech_plasma == TRUE) %>% 
+  dplyr::select(tc_pt_study_id = script_sample, evetech_id = SHIPPING.ID) %>% 
+  mutate(batch = "test_serum")
+
+md_bal_batch1 = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/EVETECH BATCH 1 SAMPLE CONVERSIONS - BAL.csv") %>% 
+  dplyr::select(tc_pt_study_id, evetech_id) %>% 
+  mutate(batch = "batch1_bal") 
+
+md_serum_batch1 = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/EVETECH BATCH 1 SAMPLE CONVERSIONS - SERUM.csv") %>% 
+  dplyr::select(tc_pt_study_id, evetech_id) %>% 
+  mutate(batch = "batch1_serum")
+
+md_serum_batch2 = read_excel("~/OneDrive - Northwestern University/Cytokine/Cytokine EveTech Batch 2/EVETECH BATCH 2 SAMPLE CONVERSION.xlsx",
+                             sheet = "SERUM") %>% 
+  dplyr::rename(tc_pt_study_id = script_sample, evetech_id = `SAMPLE ID`) %>% 
+  mutate(batch = "batch2_serum")
+
+md_bal_batch2 = read_excel("~/OneDrive - Northwestern University/Cytokine/Cytokine EveTech Batch 2/EVETECH BATCH 2 SAMPLE CONVERSION.xlsx",
+                             sheet = "BAL") %>% 
+  dplyr::rename(tc_pt_study_id = script_sample, evetech_id = `SAMPLE ID`) %>% 
+  mutate(batch = "batch2_bal")
+
+md_bal_batch4 = read_excel("~/OneDrive - Northwestern University/Cytokine/Cytokine EveTech Batch 4/sample conversion batch4.xlsx",
+                             sheet = "Sheet1") %>% 
+  dplyr::rename(tc_pt_study_id = `SCRIPT ID`, evetech_id = `evetech ID`) %>% 
+  mutate(batch = "batch4_bal")
+
+md = bind_rows(md_bal_test, md_serum_test, md_bal_batch1, md_serum_batch1,
+               md_bal_batch2, md_serum_batch2, md_bal_batch4) %>% 
+  #format auxora, other strange IDs to make consistent with SCRIPT
+  mutate(tc_pt_study_id = case_when(
+    grepl("\\d{3}-(\\d{3}-)?\\d{2}-(BAL|SER)-\\d{1,2}", tc_pt_study_id) ~ gsub("(?<!BAL|SER)-", "_", perl = T, tc_pt_study_id),
+    TRUE ~ gsub(" ", "-", tc_pt_study_id)))
+                                                                  
+rm(md_bal_test, md_serum_test, md_bal_batch1, md_serum_batch1)
+```
+   
+### Patient metadata   
+```{r}
+healthy_controls = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/211021_healthy_control_metadata.csv") %>% 
+  mutate(pna_type = "Healthy Control",
+         tc_pt_study_id = gsub(" ", "-", tc_pt_study_id))
+
+patient_md = readRDS("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/2023-07-24_SCRIPT_cytokines_metadata.rds") %>% 
+  #defactor to add healthy controls
+  dplyr::mutate(pna_type = as.character(pna_type)) %>% 
+  bind_rows(., healthy_controls)
+
+#for auxora samples with a known script ID, swap to SCRIPT ID to keep patient metadata intact
+auxora_conv = patient_md %>% 
+  dplyr::select(tc_pt_study_id, auxora_id) %>% 
+  dplyr::filter(!is.na(auxora_id))
+md = md %>% 
+  dplyr::rename(tmp = tc_pt_study_id) %>% 
+  left_join(., auxora_conv, by = c("tmp" = "auxora_id")) %>% 
+  dplyr::mutate(tc_pt_study_id = ifelse(is.na(tc_pt_study_id),
+                                        yes = tmp,
+                                        no = tc_pt_study_id)) %>% 
+  dplyr::select(-tmp)
+```
+
+   
+### Cytokine data
+```{r message=FALSE, warning=FALSE, results=FALSE}
+#excludes "ignore" directories implicitly
+inhouse_dirs = list.files("~/OneDrive - Northwestern University/02_cytokines/02_data",
+                           include.dirs = T,
+                           full.names = T,
+                           pattern = "^Batch\\d{2}_\\d{8}$")
+names(inhouse_dirs) = basename(inhouse_dirs)
+                          
+
+inhouse = read_inhouse_predict(data_dirs = inhouse_dirs, 
+                               patient_metadata = patient_md, 
+                               bind_by_metadata = NULL, 
+                               analyte_conv = read_csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/221108_analyte_conversion.csv"), 
+                               bind_by_analyte = "analyte", 
+                               collapse_replicates = T,
+                               min_events = 50, 
+                               correct_by_volume = T,
+                               return_plots = T,
+                               output_dir = "~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/manual_curve_fitting/230323_inhouse_fits",
+                               recode_lower_asymptote = F,
+                               CV_cutoff = Inf,
+                               min_mfi_conc = c(100, 50),
+                               output_summary = TRUE) %>% 
+  suppressWarnings()
+
+evetech_files = c("test_bal" = "~/OneDrive - Northwestern University/Cytokine/Cytokine Evetech Trial/Feb 1, 2022, Human Cytokine 20-Plex, Diaz 34225, BAL FLuid.xlsx", 
+                  "test_bal" = "~/OneDrive - Northwestern University/Cytokine/Cytokine Evetech Trial/Oct-4-2021-Custom-Human-Cytokine-2-plex-BAL-Fluid-Results-34225.xlsx", 
+                  "test_bal" = "~/OneDrive - Northwestern University/Cytokine/Cytokine Evetech Trial/Feb 1, 2022, Human Cytokine 48-Plex, Diaz 34225, BAL FLuid.xlsx",
+                  "test_serum" = "~/OneDrive - Northwestern University/Cytokine/Cytokine Evetech Trial/Feb 1, 2022, Human Cytokine 20-Plex, Diaz 34225, Plasma-EDTA.xlsx", 
+                  "test_serum" = "~/OneDrive - Northwestern University/Cytokine/Cytokine Evetech Trial/Feb 1, 2022, Human Cytokine 48-Plex, Diaz 34225, Plasma-EDTA.xlsx", 
+                  "test_serum" = "~/OneDrive - Northwestern University/Cytokine/Cytokine Evetech Trial/Oct-4-2021-Custom-Human-Cytokine-2-plex-Plasma-Results-34225.xlsx", 
+                  "batch1_bal" = "~/OneDrive - Northwestern University/Cytokine/Cytokine Evetech Batch 1/Oct-15-2021-Human-Cytokine-23-Plex-Diaz-35350-BAL-Fluid.xlsx",
+                  "batch1_bal" = "~/OneDrive - Northwestern University/Cytokine/Cytokine Evetech Batch 1/Oct-15-2021-Human-Cytokine-48-Plex-Diaz-35350-BAL-FLuid.xlsx",
+                  "batch1_serum" = "~/OneDrive - Northwestern University/Cytokine/Cytokine Evetech Batch 1/Oct-15-2021-Human-Cytokine-23-Plex-Diaz-35350-Plasma-EDTA.xlsx",
+                  "batch1_serum" = "~/OneDrive - Northwestern University/Cytokine/Cytokine Evetech Batch 1/Oct-15-2021-Human-Cytokine-48-Plex-Diaz-35350-Plasma-EDTA.xlsx",
+                  "batch2_bal" = "~/OneDrive - Northwestern University/Cytokine/Cytokine EveTech Batch 2/Nov 11, 2021, Human Cytokine 48-Plex, Diaz 36227, BAL.xlsx",
+                  "batch2_bal" = "~/OneDrive - Northwestern University/Cytokine/Cytokine EveTech Batch 2/Nov 11, 2021, Human Cytokine 23-Plex, Diaz 36227, BAL (1).xlsx",
+                  "batch2_serum" = "~/OneDrive - Northwestern University/Cytokine/Cytokine EveTech Batch 2/Nov 11, 2021, Human Cytokine 48-Plex, Diaz 36227, Plasma-EDTA.xlsx",
+                 "batch2_serum" = "~/OneDrive - Northwestern University/Cytokine/Cytokine EveTech Batch 2/Nov 11, 2021, Human Cytokine 23-Plex, Diaz 36227, Plasma-EDTA.xlsx",
+                 "batch4_bal" = "~/OneDrive - Northwestern University/Cytokine/Cytokine EveTech Batch 4/Human-Cytokine-23-Plex-Diaz-41376-BAL-Fluid.xlsx",
+                  "batch4_bal" = "~/OneDrive - Northwestern University/Cytokine/Cytokine EveTech Batch 4/Human-Cytokine-48-Plex-Diaz-41376-BAL-Fluid.xlsx")
+evetech = read_evetech_predict(datafiles = evetech_files, 
+                            sample_metadata = md,
+                            patient_metadata = patient_md,
+                            bind_by_sample = c("Description" = "evetech_id", "batch"),
+                            bind_by_metadata = NULL,
+                            analyte_conv = read_csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/221108_analyte_conversion.csv"),
+                            bind_by_analyte = "analyte",
+                            return_plots = T,
+                            output_dir = "~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/manual_curve_fitting/230323_evetech_fits",
+                            collapse_replicates = T, 
+                            recode_lower_asymptote = F,
+                            CV_cutoff = Inf,
+                            min_mfi_conc = c(10, 50),
+                            output_summary = TRUE) %>% 
+  suppressWarnings()
+
+
+#bind with previous                              
+complete = bind_rows(evetech, inhouse) %>% 
+  #fix long covid samples
+  dplyr::filter(!is.na(tc_pt_study_id)) %>% 
+  mutate(diagnosis = case_when(is.na(pna_type) & grepl("^LC|^PASC", tc_pt_study_id) ~ "Long COVID",
+                               grepl("^CXCR", tc_pt_study_id) ~ "Healthy Control",
+                               TRUE ~ as.character(pna_type))) %>% 
+  dplyr::rename(sex = gender) %>% 
+  dplyr::mutate(diagnosis = factor(diagnosis),
+                #rescue missing study IDs
+                study_id = ifelse(is.na(study_id) & grepl("\\d{4}-BAL-\\d{2}", tc_pt_study_id),
+                                  yes = substring(tc_pt_study_id, 1, 4),
+                                  no = study_id),
+                #set healthy controls to day 0
+                day_of_intubation = ifelse(diagnosis == "Healthy Control",
+                                           yes = 0,
+                                           no = day_of_intubation),
+                #handle chronic vent patients
+                finite_day_of_intubation = ifelse(is.infinite(day_of_intubation),
+                                                  yes = NA,
+                                                  no = day_of_intubation)) %>% 
+  #average repeat samples
+  group_by(across(c(-c(Type, Description, CV, exclude, mean_concentration:n_replicates, originator)))) %>% 
+  dplyr::summarize(mean_concentration = mean(mean_concentration, na.rm = T)) %>% 
+  ungroup() %>% 
+  #make fake study IDs for HC subjects
+  dplyr::mutate(study_id = case_when(is.na(study_id) & 
+                                       diagnosis == "Healthy Control" ~ tc_pt_study_id,
+                                     TRUE ~ study_id),
+                ir_id = case_when(is.na(ir_id) & 
+                                       diagnosis == "Healthy Control" ~ tc_pt_study_id,
+                                     TRUE ~ ir_id))
+
+analyte_conv = read_csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/221108_analyte_conversion.csv")
+all_evetech_analytes = read.csv("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/manual_curve_fitting/230323_evetech_fits/predictions_for_cutoffs.csv") %>% 
+  dplyr::select(analyte) %>% 
+  unique() %>% 
+  left_join(analyte_conv) %>%
+  dplyr::mutate(display_name = ifelse(is.na(display_name),
+                                      yes = analyte,
+                                      no = display_name)) %>% 
+  .$display_name
+all_inhouse_analytes = read.csv("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/manual_curve_fitting/230323_inhouse_fits/predictions_for_cutoffs.csv") %>% 
+  dplyr::select(analyte) %>% 
+  unique() %>% 
+  left_join(analyte_conv) %>%
+  dplyr::mutate(display_name = ifelse(is.na(display_name),
+                                      yes = analyte,
+                                      no = display_name)) %>% 
+  .$display_name
+
+overlapping_analytes = sort(intersect(all_evetech_analytes, all_inhouse_analytes))
+rm(inhouse, evetech)
+```   
+   
+# Summary stats   
+## Number of BALs   
+```{r}
+complete %>% 
+  dplyr::select(tc_pt_study_id, diagnosis, sample_origin) %>% 
+  unique() %>% 
+  group_by(diagnosis, sample_origin) %>% 
+  dplyr::summarize(n = n())
+```
+   
+## Number of patients   
+```{r}
+complete %>% 
+  dplyr::select(study_id, diagnosis, sample_origin) %>% 
+  unique() %>% 
+  group_by(diagnosis, sample_origin) %>% 
+  dplyr::summarize(n = n())
+```
+
+   
+# Filter "bad" analytes   
+## Subset to only overlapping between two assays   
+```{r}
+complete = complete %>%
+  dplyr::filter(display_name %in%  overlapping_analytes)
+```   
+   
+## Identify cutoffs from MFI/concentration relationships   
+### Organize data   
+```{r}
+inhouse_cutoffs = read.csv("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/manual_curve_fitting/230323_inhouse_fits/predictions_for_cutoffs.csv") %>% 
+  dplyr::mutate(operator = "in-house")
+
+evetech_cutoffs = read.csv("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/manual_curve_fitting/230323_evetech_fits/predictions_for_cutoffs.csv") %>% 
+  bind_rows() %>% 
+  dplyr::mutate(operator = "evetech")
+
+cutoff_data = bind_rows(inhouse_cutoffs, evetech_cutoffs)
+
+rm(inhouse_cutoffs, evetech_cutoffs)
+```
+   
+### Plot cutoffs   
+```{r}
+ggplot(cutoff_data, aes(x = MFI, fill = operator)) +
+  facet_grid(concentration ~ operator, scales = "free_y") +
+  geom_density() +
+  scale_x_log10() +
+  geom_vline(data = subset(cutoff_data, concentration == 100 & operator == "in-house"), 
+             aes(xintercept = 50), linetype = 2) +
+  geom_vline(data = subset(cutoff_data, concentration == 10 & operator == "evetech"), 
+             aes(xintercept = 50), linetype = 2)
+```   
+   
+### What rates as bad with cutoffs   
+```{r}
+bad_curves = cutoff_data %>% 
+  dplyr::filter(((concentration == 100 &
+                    operator == "in-house" & 
+                    MFI < 50) | 
+                  (concentration == 10 & 
+                     operator == "evetech" & 
+                     MFI < 50)))
+
+table(bad_curves$analyte, bad_curves$operator)
+```
+   
+## Identify non-expressed   
+### Identify cutoffs   
+```{r}
+#compare means for healthy and sick
+healthy_comp = complete %>% 
+  dplyr::mutate(is_healthy = ifelse(diagnosis == "Healthy Control",
+                                    yes = "healthy",
+                                    no = "sick")) %>% 
+  group_by(is_healthy, display_name, sample_origin) %>% 
+  dplyr::summarize(group_mean = mean(mean_concentration, na.rm = T) + 1e-1) %>% 
+  ungroup() %>% 
+  pivot_wider(names_from = is_healthy, values_from = group_mean) %>% 
+  dplyr::mutate(fc_sick_over_healthy = sick / healthy)
+
+analyte_checks = complete %>% 
+  group_by(sample_origin) %>% 
+  dplyr::mutate(n_samples = length(unique(cur_data()$tc_pt_study_id))) %>% 
+  ungroup() %>% 
+  group_by(display_name, sample_origin) %>% 
+  dplyr::summarize(mean_expression = mean(mean_concentration, na.rm = T),
+                   pct_detected = sum(mean_concentration > 0, na.rm = T) / first(n_samples) * 100,
+                   cv = sd(mean_concentration, na.rm = T) / mean(mean_concentration, na.rm = T)) %>% 
+  ungroup() %>% 
+  left_join(., healthy_comp)
+
+ggplot(analyte_checks, aes(x = mean_expression, y = pct_detected)) +
+  facet_wrap(~ sample_origin) +
+  geom_point(aes(color = cv)) + 
+  geom_text_repel(aes(label = display_name)) +
+  xlim(0, 100) +
+  geom_hline(yintercept = 25 , linetype = 2) +
+  scale_x_log10() +
+  scale_color_viridis_c(option = "magma")
+
+ggplot(analyte_checks, aes(x = mean_expression, y = pct_detected)) +
+  facet_wrap(~ sample_origin) +
+  geom_point(aes(color = log2(fc_sick_over_healthy))) + 
+  geom_text_repel(aes(label = display_name), size = 3) +
+  xlim(0, 100) +
+  geom_hline(yintercept = 25, linetype = 2) +
+  scale_x_log10() +
+  scale_color_viridis_c(option = "magma")
+```   
+   
+IL-3 is clearly not expressed, and this follows the known biology. Looks like a reasonable cutoff is detection in at least 15% od samples.   
+   
+### Apply cutoffs   
+```{r}
+keepers = analyte_checks %>% 
+  dplyr::filter(pct_detected >= 25) %>% 
+  mutate(analyte_barcode = paste(display_name, sample_origin)) %>% 
+  #these were not actually sampled in-house
+  dplyr::filter(!grepl("PDGF|RANTES", analyte_barcode))
+
+complete = complete %>% 
+  dplyr::filter(paste(display_name, sample_origin) %in% keepers$analyte_barcode)
+```      
+   
+## Remaining analytes   
+```{r}
+complete %>% 
+  group_by(sample_origin) %>% 
+  dplyr::summarize(n_analytes = length(unique(cur_data()$display_name)))
+```
+
+   
+# Filter problem samples   
+## Identify consistently low concentration outliers   
+```{r}
+summary_md = complete %>% 
+  group_by(unique_id) %>% 
+  mutate(na_count = sum(is.na(mean_concentration))) %>% 
+  ungroup() %>% 
+  dplyr::select(unique_id, diagnosis, day_of_intubation, sample_origin, na_count) %>% 
+  unique()
+
+z_medians_bal = complete %>% 
+  dplyr::filter(sample_origin == "BAL") %>% 
+  pivot_wider(id_cols = unique_id, names_from = display_name, values_from = mean_concentration) %>% 
+  column_to_rownames("unique_id") %>% 
+  as.matrix() %>% 
+  scale() %>% 
+  t() %>% 
+  matrixStats::colMedians(na.rm = T, useNames = T) %>% 
+  as_tibble(rownames = NA) %>% 
+  dplyr::rename(z_median = value) %>% 
+  rownames_to_column("unique_id") %>% 
+  left_join(., summary_md) %>% 
+  dplyr::arrange(z_median)
+
+z_medians_plasma = complete %>% 
+  dplyr::filter(sample_origin == "SERUM") %>% 
+  pivot_wider(id_cols = unique_id, names_from = display_name, values_from = mean_concentration) %>% 
+  column_to_rownames("unique_id") %>% 
+  as.matrix() %>% 
+  scale() %>% 
+  t() %>% 
+  matrixStats::colMedians(na.rm = T, useNames = T) %>% 
+  as_tibble(rownames = NA) %>% 
+  dplyr::rename(z_median = value) %>% 
+  rownames_to_column("unique_id") %>% 
+  left_join(., summary_md) %>% 
+  dplyr::arrange(z_median)
+
+z_medians = bind_rows(z_medians_bal, z_medians_plasma)
+rm(z_medians_bal, z_medians_plasma)
+```   
+   
+### Plot by group   
+   
+Healthy controls should consistently be low   
+   
+```{r}
+ggplot(z_medians, aes(x = diagnosis, y = z_median, fill = diagnosis)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2, size = 0.1) +
+  facet_grid(sample_origin ~ ., scales = "free_y") +
+  scale_fill_manual(name = "",
+                    values = diagnosis_pal) +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 12),
+        strip.text.x = element_text(size = 24))
+```
+   
+Behaves as expected. 
+   
+## Zero-inflated samples   
+```{r}
+zero_counts = complete %>% 
+  group_by(tc_pt_study_id, sample_origin, unique_id, diagnosis) %>% 
+  dplyr::summarize(zeros = sum(mean_concentration == 0, na.rm = T)) %>% 
+  dplyr::arrange(desc(zeros)) %>% 
+  left_join(., z_medians)
+```   
+   
+```{r}
+ggplot(zero_counts, aes(x = z_median, y = zeros, color = diagnosis)) +
+  facet_grid(sample_origin ~ ., scales = "free_y") +
+  geom_point(size = 0.5)
+```
+
+Zeros in most, but nothing terrible. These make sense.       
+   
+## Separate out long COVID   
+```{r}
+lc_hc = complete %>% 
+  dplyr::filter(diagnosis %in% c("Long COVID", "Healthy Control"))
+complete = complete %>% 
+  dplyr::filter(diagnosis != "Long COVID") %>% 
+  dplyr::mutate(diagnosis = factor(as.character(diagnosis))) #relevel
+```
+
+   
+# Data export   
+## Complete RDS file (with filtering)   
+```{r eval=FALSE}
+saveRDS(complete, "~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/230308_5PL_fit_data_complete.rds")
+```
+   
+# Determine distributions   
+## Normal?   
+```{r}
+shap_tests = complete %>% 
+  group_by(sample_origin, display_name) %>% 
+  dplyr::summarize(pval = shapiro.test(cur_data()$mean_concentration)$p.value) %>% 
+  ungroup() %>% 
+  mutate(padj = p.adjust(pval, method = "fdr")) %>% 
+  arrange(padj)
+```   
+   
+Even with a log transformation these are still very non-normal. Better to use nonparametric.   
+   
+# Basic analysis   
+## DEA   
+### Early samples only   
+```{r}
+#BAL samples
+bal_early = complete %>% 
+  dplyr::filter(sample_origin == "BAL" & 
+                  day_of_intubation >= 0 & 
+                  day_of_intubation <= 2)
+
+bal_comps_early = lapply(unique(bal_early$display_name), function(ana){
+  sub = subset(bal_early, display_name == ana)
+  comps = suppressWarnings(pairwise.wilcox.test(x = sub$mean_concentration, g = sub$diagnosis, p.adjust.method = "none")) %>% 
+    tidy() %>% 
+    dplyr::mutate(display_name = ana,
+                  max_y = max(sub$mean_concentration, na.rm = T)) %>% 
+    rowwise() %>% 
+    dplyr::mutate(mean_group1 = mean(subset(sub, diagnosis == cur_data()$group1)$mean_concentration, na.rm = T),
+                  mean_group2 = mean(subset(sub, diagnosis == cur_data()$group2)$mean_concentration, na.rm = T)) %>% 
+    ungroup() %>% 
+    dplyr::mutate(log2FoldChange = log2(mean_group1 / mean_group2)) }) %>% 
+  bind_rows() %>% 
+  dplyr::mutate(padj = p.adjust(p.value, method = "fdr"),
+                annot = format(p.value, digits = 2, scientific = T))
+
+write.csv(bal_comps_early, "~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/230328_BAL_comps_early.csv")
+
+#plasma samples
+plasma_early = complete %>% 
+  dplyr::filter(sample_origin == "SERUM" & 
+                  day_of_intubation >= 0 & 
+                  day_of_intubation <= 2)
+
+plasma_comps_early = lapply(unique(plasma_early$display_name), function(ana){
+  sub = subset(plasma_early, display_name == ana)
+  comps = suppressWarnings(pairwise.wilcox.test(x = sub$mean_concentration, g = sub$diagnosis, p.adjust.method = "none")) %>% 
+    tidy() %>% 
+    dplyr::mutate(display_name = ana,
+                  max_y = max(sub$mean_concentration, na.rm = T)) %>% 
+    rowwise() %>% 
+    dplyr::mutate(mean_group1 = mean(subset(sub, diagnosis == cur_data()$group1)$mean_concentration, na.rm = T),
+                  mean_group2 = mean(subset(sub, diagnosis == cur_data()$group2)$mean_concentration, na.rm = T)) %>% 
+    ungroup() %>% 
+    dplyr::mutate(log2FoldChange = log2(mean_group1 / mean_group2)) }) %>% 
+  bind_rows() %>% 
+  dplyr::mutate(padj = p.adjust(p.value, method = "fdr"),
+                annot = format(p.value, digits = 2, scientific = T))
+
+write.csv(plasma_comps_early, "~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/230328_plasma_comps_early.csv")
+```   
+   
+Plotting for easy writing (and supplement)   
+```{r}
+bal_early_cytokine_hits = bal_comps_early %>% 
+  dplyr::filter(padj < 0.05) %>% 
+  group_by(display_name) %>% 
+  mutate(yval = seq(from = log10(first(max_y)) + 0.1, by = 0.3, length.out = n())) %>% 
+  ungroup()
+
+bal_early_dea_plot = bal_early %>% 
+  dplyr::filter(display_name %in% unique(bal_early_cytokine_hits$display_name)) %>% 
+  ggplot(aes(x = diagnosis, y = mean_concentration, fill = diagnosis)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2, size = 0.1) +
+  facet_wrap(~ display_name, scales = "free_y") +
+  scale_fill_manual(name = "", values = diagnosis_pal) +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 12),
+        strip.text.x = element_text(size = 20)) +
+  scale_y_continuous(trans = scales::pseudo_log_trans(base = 10), breaks = c(0, 1e1, 1e2, 1e3, 1e4, 1e5)) +
+  geom_signif(inherit.aes = F, 
+              data = bal_early_cytokine_hits,
+              aes(xmin = group2, xmax = group1, annotations = annot, y_position = yval),
+              tip_length = 0,
+              manual=TRUE) +
+  labs(x = "", y = "Analyte concentration (pg/mL)")
+
+CairoPDF("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/230329_bal_early_hits_boxplots.pdf",
+    width = 36,
+    height = 28, 
+    family = "Arial")
+bal_early_dea_plot
+dev.off()
+
+plasma_early_cytokine_hits = plasma_comps_early %>% 
+  dplyr::filter(padj < 0.05) %>% 
+  group_by(display_name) %>% 
+  mutate(yval = seq(from = log10(first(max_y)) + 0.1, by = 0.3, length.out = n())) %>% 
+  ungroup()
+
+plasma_early_dea_plot = plasma_early %>% 
+  dplyr::filter(display_name %in% unique(plasma_early_cytokine_hits$display_name)) %>% 
+  ggplot(aes(x = diagnosis, y = mean_concentration, fill = diagnosis)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2, size = 0.1) +
+  facet_wrap(~ display_name, scales = "free_y") +
+  scale_fill_manual(name = "", values = diagnosis_pal) +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 12),
+        strip.text.x = element_text(size = 20)) +
+  scale_y_continuous(trans = scales::pseudo_log_trans(base = 10), breaks = c(0, 1e1, 1e2, 1e3, 1e4, 1e5)) +
+  geom_signif(inherit.aes = F, 
+              data = plasma_early_cytokine_hits,
+              aes(xmin = group2, xmax = group1, annotations = annot, y_position = yval),
+              tip_length = 0,
+              manual=TRUE) +
+  labs(x = "", y = "Analyte concentration (pg/mL)")
+
+CairoPDF("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/230329_plasma_early_hits_boxplots.pdf",
+    width = 36,
+    height = 28, 
+    family = "Arial")
+plasma_early_dea_plot
+dev.off()
+```
+
+   
+### All samples   
+```{r}
+#BAL samples
+bal = complete %>% 
+  dplyr::filter(sample_origin == "BAL")
+
+bal_comps = lapply(unique(bal$display_name), function(ana){
+  sub = subset(bal, display_name == ana)
+  comps = suppressWarnings(pairwise.wilcox.test(x = sub$mean_concentration, g = sub$diagnosis, p.adjust.method = "none")) %>% 
+    tidy() %>% 
+    dplyr::mutate(display_name = ana,
+                  max_y = max(sub$mean_concentration, na.rm = T)) %>% 
+    rowwise() %>% 
+    dplyr::mutate(mean_group1 = mean(subset(sub, diagnosis == cur_data()$group1)$mean_concentration, na.rm = T),
+                  mean_group2 = mean(subset(sub, diagnosis == cur_data()$group2)$mean_concentration, na.rm = T)) %>% 
+    ungroup() %>% 
+    dplyr::mutate(log2FoldChange = log2(mean_group1 / mean_group2)) }) %>% 
+  bind_rows() %>% 
+  dplyr::mutate(padj = p.adjust(p.value, method = "fdr"),
+                annot = format(p.value, digits = 2, scientific = T),
+                sample_origin = "BAL",
+                sample_type = "BAL")
+
+write.csv(bal_comps, "~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/230328_bal_comps_allSamples.csv")
+
+#plasma samples
+plasma = complete %>% 
+  dplyr::filter(sample_origin == "SERUM")
+
+plasma_comps = lapply(unique(plasma$display_name), function(ana){
+  sub = subset(plasma, display_name == ana)
+  comps = suppressWarnings(pairwise.wilcox.test(x = sub$mean_concentration, g = sub$diagnosis, p.adjust.method = "none")) %>% 
+    tidy() %>% 
+    dplyr::mutate(display_name = ana,
+                  max_y = max(sub$mean_concentration, na.rm = T)) %>% 
+    rowwise() %>% 
+    dplyr::mutate(mean_group1 = mean(subset(sub, diagnosis == cur_data()$group1)$mean_concentration, na.rm = T),
+                  mean_group2 = mean(subset(sub, diagnosis == cur_data()$group2)$mean_concentration, na.rm = T)) %>% 
+    ungroup() %>% 
+    dplyr::mutate(log2FoldChange = log2(mean_group1 / mean_group2)) }) %>% 
+  bind_rows() %>% 
+  dplyr::mutate(padj = p.adjust(p.value, method = "fdr"),
+                annot = format(p.value, digits = 2, scientific = T),
+                sample_origin = "SERUM",
+                sample_type = "Plasma")
+
+complete_comps = bind_rows(bal_comps, plasma_comps)
+
+write.csv(plasma_comps, "~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/230328_plasma_comps_allSamples.csv")
+```   
+   
+Plotting for easy writing (and supplement)   
+```{r}
+bal_cytokine_hits = bal_comps %>% 
+  dplyr::filter(padj < 0.05) %>% 
+  group_by(display_name) %>% 
+  mutate(yval = seq(from = log10(first(max_y)) + 0.1, by = 0.3, length.out = n())) %>% 
+  ungroup()
+
+bal_dea_plot = bal %>% 
+  dplyr::filter(display_name %in% unique(bal_cytokine_hits$display_name)) %>% 
+  ggplot(aes(x = diagnosis, y = mean_concentration, fill = diagnosis)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2, size = 0.1) +
+  facet_wrap(~ display_name, scales = "free_y") +
+  scale_fill_manual(name = "", values = diagnosis_pal) +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 12),
+        strip.text.x = element_text(size = 20)) +
+  scale_y_continuous(trans = scales::pseudo_log_trans(base = 10), breaks = c(0, 1e1, 1e2, 1e3, 1e4, 1e5)) +
+  geom_signif(inherit.aes = F, 
+              data = bal_cytokine_hits,
+              aes(xmin = group2, xmax = group1, annotations = annot, y_position = yval),
+              tip_length = 0,
+              manual=TRUE) +
+  labs(x = "", y = "Analyte concentration (pg/mL)")
+
+CairoPDF("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/230329_bal_complete_hits_boxplots.pdf",
+    width = 36,
+    height = 28, 
+    family = "Arial")
+bal_dea_plot
+dev.off()
+
+plasma_cytokine_hits = plasma_comps %>% 
+  dplyr::filter(padj < 0.05) %>% 
+  group_by(display_name) %>% 
+  mutate(yval = seq(from = log10(first(max_y)) + 0.1, by = 0.3, length.out = n())) %>% 
+  ungroup()
+
+plasma_dea_plot = plasma %>% 
+  dplyr::filter(display_name %in% unique(plasma_cytokine_hits$display_name)) %>% 
+  ggplot(aes(x = diagnosis, y = mean_concentration, fill = diagnosis)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2, size = 0.1) +
+  facet_wrap(~ display_name, scales = "free_y") +
+  scale_fill_manual(name = "", values = diagnosis_pal) +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 12),
+        strip.text.x = element_text(size = 20)) +
+  scale_y_continuous(trans = scales::pseudo_log_trans(base = 10), breaks = c(0, 1e1, 1e2, 1e3, 1e4, 1e5)) +
+  geom_signif(inherit.aes = F, 
+              data = plasma_cytokine_hits,
+              aes(xmin = group2, xmax = group1, annotations = annot, y_position = yval),
+              tip_length = 0,
+              manual=TRUE) +
+  labs(x = "", y = "Analyte concentration (pg/mL)")
+
+CairoPDF("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/230329_plasma_complete_hits_boxplots.pdf",
+    width = 36,
+    height = 28, 
+    family = "Arial")
+plasma_dea_plot
+dev.off()
+```
+   
+### Export all comparisons   
+```{r eval=FALSE}
+openxlsx::write.xlsx(list("BAL, early samples" = bal_comps_early,
+                          "BAL, all samples" = bal_comps,
+                          "Plasma, early samples" = plasma_comps_early,
+                          "Plasma, all samples" = plasma_comps),
+                     file = "~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/230329_extended_data_pairwise_comps.xlsx",
+                     overwrite = TRUE)
+```
+
+## Clustermaps, all samples      
+### BAL, forced clustering   
+   
+All analytes   
+
+```{r}
+#generate scaled matrix
+bal_mat = bal %>% 
+  dplyr::mutate(diagnosis = factor(diagnosis, 
+                                   levels = c("COVID-19", "Other Viral Pneumonia",
+                                              "Other Pneumonia", "Non-Pneumonia Control",
+                                              "Healthy Control"))) %>% 
+  arrange(diagnosis, day_of_intubation) %>% 
+  pivot_wider(id_cols = display_name, names_from = tc_pt_study_id, values_from = mean_concentration) %>% 
+  column_to_rownames("display_name") %>% 
+  #dplyr::filter(rowSums(.) > 0) %>% 
+  data.matrix() %>% 
+  #scales by columns, need to transpose fwd, back
+  t() %>% 
+  scale() %>% 
+  t()
+
+#generate annotation bar
+hm_md_bal = bal %>% 
+  dplyr::mutate(diagnosis = factor(diagnosis, 
+                                   levels = c("COVID-19", "Other Viral Pneumonia",
+                                              "Other Pneumonia", "Non-Pneumonia Control",
+                                              "Healthy Control"))) %>% 
+  arrange(diagnosis, day_of_intubation) %>% 
+  dplyr::select(tc_pt_study_id, Diagnosis = diagnosis, 
+                `Day of Intubation` = finite_day_of_intubation) %>% 
+  unique() %>% 
+  column_to_rownames("tc_pt_study_id")
+
+intubation_fun_bal = colorRamp2(c(0, max(hm_md_bal$`Day of Intubation`, na.rm = T)), c("white", "midnightblue"))
+hm_annot_bal = HeatmapAnnotation(df = hm_md_bal,
+                       col = list(Diagnosis = diagnosis_pal,
+                                  `Day of Intubation` = intubation_fun_bal),
+                       simple_anno_size = unit(1, "cm"), 
+                       annotation_name_gp =  gpar(fontsize = 30),
+                       annotation_legend_param = list(title_gp = gpar(fontsize = 30),
+                                                      labels_gp = gpar(fontsize = 24),
+                                                      legend_gp = gpar(fontsize = 24),
+                                                      grid_height = unit(1.5, "cm"), 
+                                                      grid_width = unit(1.5, "cm"),
+                                                      legend_height = unit(5, "cm")),
+                       show_legend = c(FALSE, FALSE, FALSE))
+
+col_fun = colorRamp2(c(-3, 0, 3), c("blue", "white", "red"))
+bal_hm = 
+  Heatmap(matrix = bal_mat,
+        name = "z-Normalized Expression",
+        cluster_rows = T,
+        cluster_columns = F,
+        clustering_distance_rows = "euclidean",
+        clustering_distance_columns = "euclidean",
+        clustering_method_columns = "ward.D2",
+        clustering_method_rows = "ward.D2",
+        show_column_names = F,
+        col = col_fun,
+        top_annotation = hm_annot_bal,
+        column_names_rot = 45, 
+        heatmap_legend_param = list(at = -3:3),
+        split = 5,
+        gap = unit(2, "mm"),
+        row_names_gp = gpar(fontsize = 10))
+
+CairoPDF("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/220810_bal_hm.pdf",
+    width = 12,
+    height = 10, 
+    family = "Arial")
+bal_hm
+dev.off()
+CairoPNG("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/220810_bal_hm.png",
+    width = 12,
+    height = 10, 
+    units = "in",
+    res = 300,
+    family = "Arial")
+bal_hm
+dev.off()
+saveRDS(bal_hm, "~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/220810_bal_hm_complete.rds")
+
+bal_hm
+```   
+   
+### Strawman callouts   
+```{r}
+#organize data
+bal_strawmen = c("IL-6", "IL-1b", "TNFa")
+bal_strawmen_callout_data = bal %>% 
+  dplyr::filter(display_name %in% bal_strawmen)
+
+#pairwise comparisons
+bal_strawmen_callout_comps = bal_comps %>% 
+  dplyr::filter(padj < 0.05 & display_name %in% bal_strawmen) %>% 
+  group_by(display_name) %>% 
+  mutate(yval = seq(from = log10(first(max_y)) + 0.3, by = 0.3, length.out = n())) %>% 
+  ungroup()
+
+#plot
+bal_strawmen_callout_plot = 
+  ggplot(bal_strawmen_callout_data, aes(x = diagnosis, y = mean_concentration, fill = diagnosis)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2, size = 0.1) +
+  facet_wrap(~ display_name, scales = "free_y") +
+  scale_fill_manual(name = "", values = diagnosis_pal) +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 12),
+        strip.text.x = element_text(size = 24),
+        axis.title.y = element_text(size = 18)) +
+  scale_y_continuous(trans = scales::pseudo_log_trans(base = 10), breaks = c(0, 1e1, 1e2, 1e3, 1e4, 1e5)) +
+  geom_signif(inherit.aes = F, 
+              data = bal_strawmen_callout_comps,
+              aes(xmin = group2, xmax = group1, annotations = annot, y_position = yval),
+              tip_length = 0,
+              manual=TRUE) +
+  labs(x = "", y = "Analyte concentration in BAL (pg/mL)")
+
+CairoPDF("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/220814_bal_strawmen_callout_plot.pdf",
+    width = 12,
+    height = 8, 
+    family = "Arial")
+bal_strawmen_callout_plot
+dev.off()
+CairoPNG("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/2220814_bal_strawmen_callout_plot.png",
+    width = 12,
+    height = 8, 
+    units = "in",
+    res = 300,
+    family = "Arial")
+bal_strawmen_callout_plot
+dev.off()
+saveRDS(bal_strawmen_callout_plot, "~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/220814_bal_strawmen_callout_plot.rds")
+
+bal_strawmen_callout_plot
+```   
+   
+### Interferons (BAL and plasma)         
+```{r eval=FALSE}
+#need to run on unfiltered data due to IFNa2 issues
+#organize data
+interferons = c("IFNa2", "IFNg")
+interferon_callout_data = complete %>% 
+  dplyr::filter(display_name %in% interferons) %>% 
+  dplyr::mutate(sample_type = factor(case_when(sample_origin == "BAL" ~ "BAL",
+                                               sample_origin == "SERUM" ~ "Plasma")))
+
+#pairwise comparisons
+interferon_callout_comps = complete_comps %>% 
+  dplyr::filter(padj < 0.05 & display_name %in% interferons) %>% 
+  group_by(sample_type, display_name) %>% 
+  mutate(yval = seq(from = log10(first(max_y)) + 0.3, by = 0.3, length.out = n())) %>% 
+  ungroup()
+
+#plot
+interferon_callout_plot = 
+  ggplot(interferon_callout_data, aes(x = diagnosis, y = mean_concentration, fill = diagnosis)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2, size = 0.1) +
+  facet_grid(~ sample_type, scales = "free") +
+  scale_fill_manual(name = "", values = diagnosis_pal) +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 12),
+        strip.text.x = element_text(size = 24),
+        strip.text.y = element_text(size = 24),
+        axis.title.y = element_text(size = 24)) +
+  scale_y_continuous(trans = scales::pseudo_log_trans(base = 10), breaks = c(0, 1e1, 1e2, 1e3, 1e4, 1e5)) +
+  geom_signif(inherit.aes = F, 
+              data = interferon_callout_comps,
+              aes(xmin = group2, xmax = group1, annotations = annot, y_position = yval),
+              tip_length = 0,
+              manual=TRUE) +
+  labs(x = "", y = "[IFNg] in BAL (pg/mL)")
+
+CairoPDF("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/230402_interferon_callout_plot.pdf",
+    width = 12,
+    height = 10, 
+    family = "Arial")
+interferon_callout_plot
+dev.off()
+CairoPNG("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/240402_interferon_callout_plot.png",
+    width = 12,
+    height = 10, 
+    units = "in",
+    res = 300,
+    family = "Arial")
+interferon_callout_plot
+dev.off()
+
+interferon_callout_plot
+```   
+   
+Just significantly variable   
+   
+```{r}
+#get significantly variable hits
+bal_anovas = vapply(unique(bal$display_name), function(ana){
+  sub = subset(bal, display_name == ana)
+  anova_pval = kruskal.test(mean_concentration ~ diagnosis, sub) %>% 
+    .$p.value
+  return(anova_pval) }, 1) 
+
+bal_anova_df = tibble(display_name = names(bal_anovas), pval = as.numeric(bal_anovas)) %>% 
+  mutate(padj = p.adjust(pval, method = "fdr")) %>% 
+  dplyr::filter(padj < 0.05)
+
+#generate heatmap
+#generate scaled matrix
+bal_mat_sig = bal %>% 
+  dplyr::mutate(diagnosis = factor(diagnosis, 
+                                   levels = c("COVID-19", "Other Viral Pneumonia",
+                                              "Other Pneumonia", "Non-Pneumonia Control",
+                                              "Healthy Control"))) %>% 
+  arrange(diagnosis, day_of_intubation) %>% 
+  dplyr::filter(display_name %in% bal_anova_df$display_name & !is.na(diagnosis)) %>% 
+  pivot_wider(id_cols = display_name, names_from = tc_pt_study_id, values_from = mean_concentration) %>% 
+  column_to_rownames("display_name") %>% 
+  data.matrix() %>% 
+  #scales by columns, need to transpose fwd, back
+  t() %>% 
+  scale() %>% 
+  t()
+
+bal_hm_sig = 
+  Heatmap(matrix = bal_mat_sig,
+        name = "z-Normalized Expression",
+        cluster_rows = F,
+        cluster_columns = F,
+        clustering_distance_rows = "euclidean",
+        clustering_distance_columns = "euclidean",
+        clustering_method_columns = "ward.D2",
+        clustering_method_rows = "ward.D2",
+        show_column_names = F,
+        col = col_fun,
+        top_annotation = hm_annot_bal,
+        #split = 4,
+        row_title_gp = gpar(fontsize = 24),
+        gap = unit(2, "mm"),
+        column_names_rot = 70, 
+        row_names_gp = gpar(fontsize = 18),
+        heatmap_legend_param = list(title = "z-Normalized\nExpression",
+                                    at = -3:3,
+                                    direction = "horizontal",
+                                    title_position = "topcenter",
+                                    title_gp = gpar(fontsize = 30),
+                                    labels_gp = gpar(fontsize = 24),
+                                    grid_height = unit(1, "cm"), 
+                                    grid_width = unit(1, "cm")),
+        show_heatmap_legend = FALSE)
+
+CairoPDF("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/220810_bal_hm_significant.pdf",
+    width = 12,
+    height = 10, 
+    family = "Arial")
+bal_hm_sig
+dev.off()
+CairoPNG("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/220810_bal_hm_significant.png",
+    width = 12,
+    height = 10, 
+    units = "in",
+    res = 300,
+    family = "Arial")
+bal_hm_sig
+dev.off()
+saveRDS(bal_hm_sig, "~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/220810_bal_hm_significant.rds")
+
+bal_hm_sig
+```
+
+   
+### Plasma   
+```{r}
+#generate scaled matrix
+plasma_mat = plasma %>% 
+  dplyr::mutate(diagnosis = factor(diagnosis, 
+                                   levels = c("COVID-19", "Other Viral Pneumonia",
+                                              "Other Pneumonia", "Non-Pneumonia Control",
+                                              "Healthy Control"))) %>% 
+  arrange(diagnosis, day_of_intubation) %>% 
+  pivot_wider(id_cols = display_name, names_from = tc_pt_study_id, values_from = mean_concentration) %>% 
+  column_to_rownames("display_name") %>% 
+  data.matrix() %>% 
+  #scales by columns, need to transpose fwd, back
+  t() %>% 
+  scale() %>% 
+  t()
+
+#generate annotation bar
+hm_md_plasma = plasma %>% 
+  dplyr::mutate(diagnosis = factor(diagnosis, 
+                                   levels = c("COVID-19", "Other Viral Pneumonia",
+                                              "Other Pneumonia", "Non-Pneumonia Control",
+                                              "Healthy Control"))) %>% 
+  arrange(diagnosis, day_of_intubation) %>% 
+  dplyr::select(tc_pt_study_id, Diagnosis = diagnosis, 
+                `Day of Intubation` = finite_day_of_intubation) %>% 
+  unique() %>% 
+  column_to_rownames("tc_pt_study_id")
+
+intubation_fun_plasma = colorRamp2(c(0, max(hm_md_plasma$`Day of Intubation`, na.rm = T)), c("white", "midnightblue"))
+hm_annot_plasma = HeatmapAnnotation(df = hm_md_plasma,
+                       col = list(Diagnosis = diagnosis_pal,
+                                  `Day of Intubation` = intubation_fun_plasma),
+                       simple_anno_size = unit(1, "cm"), 
+                       annotation_name_gp =  gpar(fontsize = 30),
+                       annotation_legend_param = list(title_gp = gpar(fontsize = 30),
+                                                      labels_gp = gpar(fontsize = 24),
+                                                      legend_gp = gpar(fontsize = 24),
+                                                      grid_height = unit(1.5, "cm"), 
+                                                      grid_width = unit(1.5, "cm"),
+                                                      legend_height = unit(5, "cm")))
+
+col_fun = colorRamp2(c(-3, 0, 3), c("blue", "white", "red"))
+plasma_hm = 
+  Heatmap(matrix = plasma_mat,
+        name = "z-Normalized Expression",
+        cluster_rows = F,
+        cluster_columns = F,
+        clustering_distance_rows = "euclidean",
+        clustering_distance_columns = "euclidean",
+        clustering_method_columns = "ward.D2",
+        clustering_method_rows = "ward.D2",
+        show_column_names = F,
+        col = col_fun,
+        top_annotation = hm_annot_plasma,
+        column_names_rot = 45, 
+        heatmap_legend_param = list(at = -3:3),
+        #split = 4,
+        gap = unit(2, "mm"),
+        row_names_gp = gpar(fontsize = 10))
+
+CairoPDF("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/220810_plasma_hm.pdf",
+    width = 12,
+    height = 10, 
+    family = "Arial")
+plasma_hm
+dev.off()
+CairoPNG("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/220810_plasma_hm.png",
+    width = 12,
+    height = 10, 
+    units = "in",
+    res = 300,
+    family = "Arial")
+plasma_hm
+dev.off()
+saveRDS(plasma_hm, "~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/220810_plasma_hm_complete.rds")
+
+plasma_hm
+```    
+   
+### Strawman callouts   
+```{r}
+#organize data
+plasma_strawmen = c("IL-6", "IL-1b", "TNFa")
+plasma_strawmen_callout_data = plasma %>% 
+  dplyr::filter(display_name %in% plasma_strawmen)
+
+#pairwise comparisons
+plasma_strawmen_callout_comps = plasma_comps %>% 
+  dplyr::filter(padj < 0.05 & display_name %in% plasma_strawmen) %>% 
+  group_by(display_name) %>%
+  mutate(yval = seq(from = log10(first(max_y)) + 0.3, by = 0.3, length.out = n())) %>%
+  ungroup()
+
+#plot
+plasma_strawmen_callout_plot = 
+  ggplot(plasma_strawmen_callout_data, aes(x = diagnosis, y = mean_concentration, fill = diagnosis)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2, size = 0.1) +
+  facet_wrap(~ display_name, scales = "free_y") +
+  scale_fill_manual(name = "", values = diagnosis_pal) +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 12),
+        strip.text.x = element_text(size = 24),
+        axis.title.y = element_text(size = 18)) +
+  scale_y_continuous(trans = scales::pseudo_log_trans(base = 10), breaks = c(0, 1e1, 1e2, 1e3, 1e4, 1e5)) +
+  geom_signif(inherit.aes = F,
+              data = plasma_strawmen_callout_comps,
+              aes(xmin = group2, xmax = group1, annotations = annot, y_position = yval),
+              tip_length = 0,
+              manual=TRUE) +
+  labs(x = "", y = "Analyte concentration in plasma (pg/mL)")
+
+CairoPDF("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/220814_plasma_strawmen_callout_plot.pdf",
+    width = 12,
+    height = 8, 
+    family = "Arial")
+plasma_strawmen_callout_plot
+dev.off()
+CairoPNG("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/2220814_plasma_strawmen_callout_plot.png",
+    width = 12,
+    height = 8, 
+    units = "in",
+    res = 300,
+    family = "Arial")
+plasma_strawmen_callout_plot
+dev.off()
+saveRDS(plasma_strawmen_callout_plot, "~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/220814_plasma_strawmen_callout_plot.rds")
+
+plasma_strawmen_callout_plot
+```   
+   
+Just significantly variable   
+   
+```{r}
+#get significantly variable hits
+plasma_anovas = vapply(unique(plasma$display_name), function(ana){
+  sub = subset(plasma, display_name == ana)
+  anova_pval = kruskal.test(mean_concentration ~ diagnosis, sub) %>% 
+    .$p.value
+  return(anova_pval) }, 1) 
+
+plasma_anova_df = tibble(display_name = names(plasma_anovas), pval = as.numeric(plasma_anovas)) %>% 
+  mutate(padj = p.adjust(pval, method = "fdr")) %>% 
+  dplyr::filter(padj < 0.05)
+
+#generate heatmap
+#generate scaled matrix
+plasma_mat_sig = plasma %>% 
+  dplyr::mutate(diagnosis = factor(diagnosis, 
+                                   levels = c("COVID-19", "Other Viral Pneumonia",
+                                              "Other Pneumonia", "Non-Pneumonia Control",
+                                              "Healthy Control"))) %>% 
+  arrange(diagnosis, day_of_intubation) %>% 
+  dplyr::filter(display_name %in% plasma_anova_df$display_name) %>% 
+  pivot_wider(id_cols = display_name, names_from = tc_pt_study_id, values_from = mean_concentration) %>% 
+  column_to_rownames("display_name") %>% 
+  data.matrix() %>% 
+  #scales by columns, need to transpose fwd, back
+  t() %>% 
+  scale() %>% 
+  t()
+
+plasma_hm_sig = 
+  Heatmap(matrix = plasma_mat_sig,
+        name = "z-Normalized Expression",
+        cluster_rows = F,
+        cluster_columns = F,
+        clustering_distance_rows = "euclidean",
+        clustering_distance_columns = "euclidean",
+        clustering_method_columns = "ward.D2",
+        clustering_method_rows = "ward.D2",
+        show_column_names = F,
+        col = col_fun,
+        top_annotation = hm_annot_plasma,
+        #split = 4,
+        row_title_gp = gpar(fontsize = 24),
+        gap = unit(2, "mm"),
+        column_names_rot = 70, 
+        row_names_gp = gpar(fontsize = 18),
+        heatmap_legend_param = list(title = "z-Normalized\nExpression",
+                                    at = -3:3,
+                                    direction = "horizontal",
+                                    title_position = "topcenter",
+                                    title_gp = gpar(fontsize = 30),
+                                    labels_gp = gpar(fontsize = 24),
+                                    grid_height = unit(1, "cm"), 
+                                    grid_width = unit(1, "cm")))
+
+CairoPDF("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/220810_plasma_hm_significant.pdf",
+    width = 12,
+    height = 10, 
+    family = "Arial")
+plasma_hm_sig
+dev.off()
+CairoPNG("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/220810_plasma_hm_significant.png",
+    width = 12,
+    height = 10, 
+    units = "in",
+    res = 300,
+    family = "Arial")
+plasma_hm_sig
+dev.off()
+saveRDS(plasma_hm_sig, "~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/220810_plasma_hm_significant.rds")
+
+plasma_hm_sig
+```   
+
+   
+## Clustermaps, early samples      
+### BAL   
+   
+All analytes   
+
+```{r}
+#generate scaled matrix
+bal_mat_early = bal_early %>% 
+  pivot_wider(id_cols = display_name, names_from = tc_pt_study_id, values_from = mean_concentration) %>% 
+  column_to_rownames("display_name") %>% 
+  data.matrix() %>% 
+  #scales by columns, need to transpose fwd, back
+  t() %>% 
+  scale() %>% 
+  t()
+
+#generate annotation bar
+hm_md_bal_early = bal_early %>% 
+  dplyr::select(tc_pt_study_id, Diagnosis = diagnosis) %>% 
+  unique() %>% 
+  column_to_rownames("tc_pt_study_id")
+
+hm_annot_bal_early = HeatmapAnnotation(df = hm_md_bal_early,
+                       col = list(Diagnosis = diagnosis_pal),
+                       simple_anno_size = unit(1, "cm"), 
+                       annotation_name_gp =  gpar(fontsize = 30),
+                       annotation_legend_param = list(title_gp = gpar(fontsize = 30),
+                                                      labels_gp = gpar(fontsize = 24),
+                                                      legend_gp = gpar(fontsize = 24),
+                                                      grid_height = unit(1.5, "cm"), 
+                                                      grid_width = unit(1.5, "cm"),
+                                                      legend_height = unit(5, "cm")),
+                       show_legend = c(FALSE, FALSE))
+bal_hm_early = 
+  Heatmap(matrix = bal_mat_early,
+        cluster_rows = T,
+        cluster_columns = T,
+        clustering_distance_rows = "euclidean",
+        clustering_distance_columns = "euclidean",
+        clustering_method_columns = "ward.D2",
+        clustering_method_rows = "ward.D2",
+        show_column_names = F,
+        col = col_fun,
+        top_annotation = hm_annot_bal_early,
+        column_names_rot = 70, 
+        row_names_gp = gpar(fontsize = 18),
+        heatmap_legend_param = list(title = "z-Normalized\nExpression",
+                                    at = -3:3,
+                                    direction = "horizontal",
+                                    title_position = "topcenter",
+                                    title_gp = gpar(fontsize = 30),
+                                    labels_gp = gpar(fontsize = 24),
+                                    legend_width = unit(6, "cm"),
+                                    legend_height = unit(2, "cm")))
+
+CairoPDF("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/220810_bal_hm_early.pdf",
+    width = 12,
+    height = 10, 
+    family = "Arial")
+bal_hm_early
+dev.off()
+CairoPNG("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/220810_bal_hm_early.png",
+    width = 12,
+    height = 10, 
+    units = "in",
+    res = 300,
+    family = "Arial")
+bal_hm_early
+dev.off()
+saveRDS(bal_hm_early, "~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/220810_bal_hm_early.rds")
+
+bal_hm_early
+```   
+   
+Just significantly variable   
+   
+```{r}
+#get significantly variable hits
+bal_anovas_early = vapply(unique(bal_early$display_name), function(ana){
+  sub = subset(bal_early, display_name == ana)
+  anova_pval = kruskal.test(mean_concentration ~ diagnosis, sub) %>% 
+    .$p.value
+  return(anova_pval) }, 1) 
+
+bal_anova_df_early = tibble(display_name = names(bal_anovas_early), pval = as.numeric(bal_anovas_early)) %>% 
+  mutate(padj = p.adjust(pval, method = "fdr")) %>% 
+  dplyr::filter(padj < 0.05)
+
+#generate heatmap
+#generate scaled matrix
+bal_mat_sig_early = bal_early %>% 
+  dplyr::filter(display_name %in% bal_anova_df_early$display_name) %>% 
+  pivot_wider(id_cols = display_name, names_from = tc_pt_study_id, values_from = mean_concentration) %>% 
+  column_to_rownames("display_name") %>% 
+  data.matrix() %>% 
+  #scales by columns, need to transpose fwd, back
+  t() %>% 
+  scale() %>% 
+  t()
+
+bal_hm_sig_early = 
+  Heatmap(matrix = bal_mat_sig_early,
+        name = "z-Normalized Expression",
+        cluster_rows = T,
+        cluster_columns = T,
+        clustering_distance_rows = "euclidean",
+        clustering_distance_columns = "euclidean",
+        clustering_method_columns = "ward.D2",
+        clustering_method_rows = "ward.D2",
+        show_column_names = F,
+        col = col_fun,
+        top_annotation = hm_annot_bal_early,
+        column_names_rot = 70, 
+        row_names_gp = gpar(fontsize = 18),
+        heatmap_legend_param = list(title = "z-Normalized\nExpression",
+                                    at = -3:3,
+                                    direction = "horizontal",
+                                    title_position = "topcenter",
+                                    title_gp = gpar(fontsize = 30),
+                                    labels_gp = gpar(fontsize = 24),
+                                    grid_height = unit(1, "cm"), 
+                                    grid_width = unit(1, "cm")),
+        show_heatmap_legend = FALSE)
+
+CairoPDF("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/220810_bal_hm_significant_early.pdf",
+    width = 12,
+    height = 10, 
+    family = "Arial")
+bal_hm_sig_early
+dev.off()
+CairoPNG("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/220810_bal_hm_significant_early.png",
+    width = 12,
+    height = 10, 
+    units = "in",
+    res = 300,
+    family = "Arial")
+bal_hm_sig_early
+dev.off()
+saveRDS(bal_hm_sig_early, "~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/220810_bal_hm_significant_early.rds")
+
+bal_hm_sig_early
+```
+   
+All of the nature paper hits really stand out here.   
+      
+### Callouts (early)   
+```{r}
+#organize data
+bal_early_hits = c("IL-1b", "IL-6", "TNFa",
+                   "CCL2", "CXCL10", "CCL8")
+bal_early_callout_data = bal_early %>% 
+  #for ordering by COVID specificity
+  dplyr::mutate(display_name = factor(display_name, levels = c("CXCL10", "CCL8", "CCL2",
+                                                               "IL-6", "TNFa", "IL-1b"))) %>% 
+  dplyr::filter(display_name %in% bal_early_hits)
+
+#pairwise comparisons
+bal_early_callout_comps = bal_comps_early %>% 
+  dplyr::filter(padj < 0.05 & display_name %in% bal_early_hits) %>% 
+  #for ordering by COVID specificity
+  dplyr::mutate(display_name = factor(display_name, levels = c("CXCL10", "CCL8", "CCL2",
+                                                               "IL-6", "TNFa", "IL-1b"))) %>% 
+  group_by(display_name) %>% 
+  mutate(yval = seq(from = log10(first(max_y)) + 0.3, by = 0.3, length.out = n())) %>% 
+  ungroup()
+
+#plot
+bal_early_callout_plot = 
+  ggplot(bal_early_callout_data, aes(x = diagnosis, y = mean_concentration, fill = diagnosis)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2, size = 0.1) +
+  facet_wrap(~ display_name, scales = "free_y") +
+  scale_fill_manual(name = "", values = diagnosis_pal) +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 24),
+        axis.text.y = element_text(size = 24),
+        axis.title.x = element_text(size = 36),
+        axis.title.y = element_text(size = 36),
+         strip.text = element_text(size = 24)) +
+  scale_y_continuous(trans = scales::pseudo_log_trans(base = 10), breaks = c(0, 1e1, 1e2, 1e3, 1e4, 1e5)) +
+  geom_signif(inherit.aes = F, 
+              data = bal_early_callout_comps,
+              aes(xmin = group2, xmax = group1, annotations = annot, y_position = yval),
+              tip_length = 0,
+              manual=TRUE) +
+  labs(x = "", y = "Analyte concentration in BAL (pg/mL)")
+
+CairoPDF("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/220814_bal_early_callout_plot.pdf",
+    width = 12,
+    height = 10, 
+    family = "Arial")
+bal_early_callout_plot
+dev.off()
+CairoPNG("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/2220814_bal_early_callout_plot.png",
+    width = 12,
+    height = 10, 
+    units = "in",
+    res = 300,
+    family = "Arial")
+bal_early_callout_plot
+dev.off()
+saveRDS(bal_early_callout_plot, "~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/220814_bal_early_callout_plot.rds")
+
+bal_early_callout_plot
+```
+
+   
+### Plasma   
+```{r}
+#generate scaled matrix
+plasma_mat_early = plasma_early %>% 
+  pivot_wider(id_cols = display_name, names_from = tc_pt_study_id, values_from = mean_concentration) %>% 
+  column_to_rownames("display_name") %>% 
+  data.matrix() %>% 
+  #scales by columns, need to transpose fwd, back
+  t() %>% 
+  scale() %>% 
+  t()
+
+#generate annotation bar
+hm_md_plasma_early = plasma_early %>% 
+  dplyr::select(tc_pt_study_id, Diagnosis = diagnosis) %>% 
+  unique() %>% 
+  column_to_rownames("tc_pt_study_id")
+
+hm_annot_plasma_early = HeatmapAnnotation(df = hm_md_plasma_early,
+                       col = list(Diagnosis = diagnosis_pal),
+                       simple_anno_size = unit(1, "cm"),
+                       annotation_name_gp =  gpar(fontsize = 30),
+                       annotation_legend_param = list(title_gp = gpar(fontsize = 30),
+                                                      labels_gp = gpar(fontsize = 24),
+                                                      legend_gp = gpar(fontsize = 24),
+                                                      grid_height = unit(1.5, "cm"), 
+                                                      grid_width = unit(1.5, "cm"),
+                                                      legend_height = unit(5, "cm")))
+
+plasma_hm_early = 
+  Heatmap(matrix = plasma_mat_early,
+        name = "z-Normalized Expression",
+        cluster_rows = F,
+        cluster_columns = T,
+        clustering_distance_rows = "euclidean",
+        clustering_distance_columns = "euclidean",
+        clustering_method_columns = "ward.D2",
+        clustering_method_rows = "ward.D2",
+        show_column_names = F,
+        col = col_fun,
+        top_annotation = hm_annot_plasma_early,
+        column_names_rot = 45, 
+        heatmap_legend_param = list(at = -3:3),
+        row_names_gp = gpar(fontsize = 10))
+
+CairoPDF("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/220810_plasma_hm_early.pdf",
+    width = 12,
+    height = 10, 
+    family = "Arial")
+plasma_hm_early
+dev.off()
+CairoPNG("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/220810_plasma_hm_early.png",
+    width = 12,
+    height = 10, 
+    units = "in",
+    res = 300,
+    family = "Arial")
+plasma_hm_early
+dev.off()
+saveRDS(plasma_hm_early, "~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/220810_plasma_hm_early.rds")
+
+plasma_hm_early
+```   
+   
+Just significantly variable   
+   
+```{r}
+#get significantly variable hits
+plasma_anovas_early = vapply(unique(plasma_early$display_name), function(ana){
+  sub = subset(plasma_early, display_name == ana)
+  anova_pval = kruskal.test(mean_concentration ~ diagnosis, sub) %>% 
+    .$p.value
+  return(anova_pval) }, 1) 
+
+plasma_anova_df_early = tibble(display_name = names(plasma_anovas_early), pval = as.numeric(plasma_anovas_early)) %>% 
+  mutate(padj = p.adjust(pval, method = "fdr")) %>% 
+  dplyr::filter(padj < 0.05)
+
+#generate heatmap
+#generate scaled matrix
+plasma_mat_sig_early = plasma_early %>% 
+  dplyr::filter(display_name %in% plasma_anova_df_early$display_name) %>% 
+  pivot_wider(id_cols = display_name, names_from = tc_pt_study_id, values_from = mean_concentration) %>% 
+  column_to_rownames("display_name") %>% 
+  data.matrix() %>% 
+  #scales by columns, need to transpose fwd, back
+  t() %>% 
+  scale() %>% 
+  t()
+
+plasma_hm_sig_early = 
+  Heatmap(matrix = plasma_mat_sig_early,
+        name = "z-Normalized Expression",
+        cluster_rows = T,
+        cluster_columns = T,
+        clustering_distance_rows = "euclidean",
+        clustering_distance_columns = "euclidean",
+        clustering_method_columns = "ward.D2",
+        clustering_method_rows = "ward.D2",
+        show_column_names = F,
+        col = col_fun,
+        top_annotation = hm_annot_plasma_early,
+        column_names_rot = 70, 
+        row_names_gp = gpar(fontsize = 18),
+        heatmap_legend_param = list(title = "z-Normalized\nExpression",
+                                    at = -3:3,
+                                    direction = "horizontal",
+                                    title_position = "topcenter",
+                                    title_gp = gpar(fontsize = 30),
+                                    labels_gp = gpar(fontsize = 24),
+                                    grid_height = unit(1, "cm"), 
+                                    grid_width = unit(1, "cm")))
+
+CairoPDF("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/220810_plasma_hm_significant_early.pdf",
+    width = 12,
+    height = 10, 
+    family = "Arial")
+plasma_hm_sig_early
+dev.off()
+CairoPNG("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/220810_plasma_hm_significant_early.png",
+    width = 12,
+    height = 10, 
+    units = "in",
+    res = 300,
+    family = "Arial")
+plasma_hm_sig_early
+dev.off()
+saveRDS(plasma_hm_sig_early, "~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/220810_plasma_hm_significant_early.rds")
+
+plasma_hm_sig_early
+```   
+   
+### Callouts (early)   
+```{r}
+#organize data
+plasma_early_hits = c("IL-1b", "IL-6", "TNFa",
+                      "CCL2", "CXCL10", "CCL8")
+plasma_early_callout_data = plasma_early %>% 
+  #for ordering by COVID specificity
+  dplyr::mutate(display_name = factor(display_name, levels = c("CXCL10", "CCL8", "CCL2",
+                                                               "IL-6", "TNFa", "IL-1b"))) %>% 
+  dplyr::filter(display_name %in% plasma_early_hits)
+
+#pairwise comparisons
+plasma_early_callout_comps = plasma_comps_early %>% 
+  dplyr::filter(padj < 0.05 & display_name %in% plasma_early_hits) %>% 
+  #for ordering by COVID specificity
+  dplyr::mutate(display_name = factor(display_name, levels = c("CXCL10", "CCL8", "CCL2",
+                                                               "IL-6", "TNFa", "IL-1b"))) %>% 
+  group_by(display_name) %>% 
+  mutate(yval = seq(from = log10(first(max_y)) + 0.2, by = 0.2, length.out = n())) %>% 
+  ungroup()
+
+#plot
+plasma_early_callout_plot = 
+  ggplot(plasma_early_callout_data, aes(x = diagnosis, y = mean_concentration, fill = diagnosis)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.2, size = 0.1) +
+  facet_wrap(~ display_name, scales = "free_y", nrow = 2) +
+  scale_fill_manual(name = "", values = diagnosis_pal) +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 24),
+        axis.text.y = element_text(size = 24),
+        axis.title.x = element_text(size = 36),
+        axis.title.y = element_text(size = 36),
+         strip.text = element_text(size = 24)) +
+  scale_y_continuous(trans = scales::pseudo_log_trans(base = 10), breaks = c(0, 1e1, 1e2, 1e3, 1e4, 1e5)) +
+  geom_signif(inherit.aes = F, 
+              data = plasma_early_callout_comps,
+              aes(xmin = group2, xmax = group1, annotations = annot, y_position = yval),
+              tip_length = 0,
+              manual=TRUE) +
+  labs(x = "", y = "Analyte concentration in plasma (pg/mL)")
+
+CairoPDF("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/220814_plasma_early_callout_plot.pdf",
+    width = 12,
+    height = 8, 
+    family = "Arial")
+plasma_early_callout_plot
+dev.off()
+CairoPNG("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/2220814_plasma_early_callout_plot.png",
+    width = 12,
+    height = 8, 
+    units = "in",
+    res = 300,
+    family = "Arial")
+plasma_early_callout_plot
+dev.off()
+saveRDS(plasma_early_callout_plot, "~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/220814_plasma_early_callout_plot.rds")
+
+plasma_early_callout_plot
+```
+   
+# CXCL10   
+## Is BAL predictive of plasma concentrations?   
+### Organize data   
+```{r}
+cxcl10 = complete %>% 
+  dplyr::filter(display_name == "CXCL10" & diagnosis == "COVID-19") %>% 
+  dplyr::select(tc_pt_study_id, mean_concentration, sample_origin) %>% 
+  pivot_wider(names_from = sample_origin, values_from = mean_concentration) %>% 
+  dplyr::rename(plasma = SERUM) %>% 
+  column_to_rownames("tc_pt_study_id") %>% 
+  na.omit()
+```
+   
+### Correlations
+```{r}
+cor.test(cxcl10$BAL, cxcl10$plasma, method = "pearson")
+cor.test(cxcl10$BAL, cxcl10$plasma, method = "spearman")
+```   
+   
+### Plot
+```{r}
+ggplot(cxcl10, aes(x = BAL, y = plasma)) + 
+  geom_point() +
+  geom_smooth(method = "loess") +
+  theme_bw(base_family = "Arial") +
+  scale_x_log10() +
+  scale_y_log10() +
+  xlim(0, NA) +
+  ylim(0, NA)
+```
+   
+# Correlation between BAL and plasma   
+   
+Get an impression of BAL leak into blood   
+  
+## By analyte   
+## Calculate   
+```{r}
+#for performing correlations on matrices of paired BAL and plasma observations
+perform_correlation = function(df, cor_type){
+  cor_df = df %>% 
+    dplyr::select(tc_pt_study_id, sample_origin, mean_concentration) %>% 
+    pivot_wider(names_from = sample_origin, values_from = mean_concentration,
+                names_prefix = "concentration_") %>% 
+    na.omit()
+  
+  if(nrow(cor_df) < 3 | ncol(cor_df) < 3) #some analytes not in BAL/plasma
+  {
+    correlation = data.frame(p.value = NA_real_,
+                             estimate = NA_real_)
+  } else
+  {
+    correlation = cor.test(x = cor_df$concentration_BAL, 
+                           y = cor_df$concentration_SERUM,
+                           exact = T, 
+                           method = cor_type)
+  }
+  correlation$n = nrow(cor_df)
+  return(correlation)
+}
+
+analyte_cors = complete %>% 
+  group_by(display_name) %>% 
+  dplyr::summarize(pearson_pval = perform_correlation(cur_data(), cor_type = "pearson")$p.value,
+                   pearson_cor = perform_correlation(cur_data(), cor_type = "pearson")$estimate,
+                   spearman_pval = perform_correlation(cur_data(), cor_type = "spearman")$p.value,
+                   spearman_cor = perform_correlation(cur_data(), cor_type = "spearman")$estimate,
+                   n_values = perform_correlation(cur_data(), cor_type = "pearson")$n) %>% 
+  ungroup() %>% 
+  dplyr::mutate(pearson_qval = p.adjust(pearson_pval, method = "fdr"),
+                spearman_qval = p.adjust(spearman_pval, method = "fdr"))
+```
+   
+### Plot correlations   
+```{r}
+cor_mat = analyte_cors %>% 
+  na.omit() %>% 
+  column_to_rownames("display_name") %>% 
+  dplyr::select(pearson = pearson_cor, spearman = spearman_cor) %>% 
+  data.matrix()
+pval_mat = analyte_cors %>% 
+  na.omit() %>% 
+  column_to_rownames("display_name") %>% 
+  dplyr::select(pearson_qval, spearman_qval) %>% 
+  data.matrix()
+
+cor_fun = colorRamp2(c(-1, 0, 1), c("blue", "white", "red"))
+cor_hm = 
+  Heatmap(matrix = cor_mat,
+        name = "Correlation Coefficient",
+        cluster_rows = T,
+        cluster_columns = F,
+        clustering_distance_rows = "euclidean",
+        clustering_distance_columns = "euclidean",
+        clustering_method_columns = "ward.D2",
+        clustering_method_rows = "ward.D2",
+        show_column_names = T,
+        col = cor_fun,
+        cell_fun = function(j, i, x, y, w, h, fill) {
+          if(pval_mat[i, j] > 0.05){
+            grid.text("NS", x, y)
+          }
+        },
+        column_names_rot = 45)
+
+CairoPDF("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/221027_BAL_plasma_cor_hm.pdf",
+    width = 10,
+    height = 10, 
+    family = "Arial")
+cor_hm
+dev.off()
+CairoPNG("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/2221027_BAL_plasma_cor_hm.png",
+    width = 10,
+    height = 10, 
+    units = "in",
+    res = 300,
+    family = "Arial")
+cor_hm
+dev.off()
+
+cor_hm
+```
+
+### Plot IL-6   
+```{r}
+il6_corplot = complete %>% dplyr::filter(display_name == "IL-6") %>% 
+  dplyr::select(tc_pt_study_id, mean_concentration, sample_origin, diagnosis) %>% 
+  unique() %>% 
+  pivot_wider(names_from = sample_origin, values_from = mean_concentration) %>% 
+  ggplot(aes(x = BAL, y = SERUM, color = diagnosis)) + 
+    geom_point() +
+    geom_smooth(method = "lm", se = F) +
+    theme_bw(base_family = "Arial") +
+    labs(x = "BAL", y = "Plasma") +
+    scale_x_continuous(trans = "pseudo_log", 
+                       breaks = c(0, 1e1, 1e2, 1e3, 1e4, 1e5)) +
+    scale_y_continuous(trans = "pseudo_log", 
+                       breaks = c(0, 1e1, 1e2, 1e3, 1e4, 1e5))
+
+CairoPNG("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/2221027_il6_corplot_hm.png",
+    width = 9,
+    height = 6, 
+    units = "in",
+    res = 300,
+    family = "Arial")
+il6_corplot
+dev.off()
+
+il6_corplot
+```
+   
+### Plot CXCL10   
+```{r}
+cxcl10_corplot = complete %>% dplyr::filter(display_name == "CXCL10") %>% 
+  dplyr::select(tc_pt_study_id, mean_concentration, sample_origin, diagnosis) %>% 
+  unique() %>% 
+  pivot_wider(names_from = sample_origin, values_from = mean_concentration) %>% 
+  ggplot(aes(x = BAL, y = SERUM, color = diagnosis)) + 
+    geom_point() +
+    geom_smooth(method = "lm", se = F) +
+    theme_bw(base_family = "Arial") +
+    labs(x = "BAL", y = "Plasma") +
+    scale_x_continuous(trans = "pseudo_log", 
+                       breaks = c(0, 1e1, 1e2, 1e3, 1e4, 1e5)) +
+    scale_y_continuous(trans = "pseudo_log", 
+                       breaks = c(0, 1e1, 1e2, 1e3, 1e4, 1e5))
+
+CairoPNG("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/2221027_cxcl10_corplot_hm.png",
+    width = 9,
+    height = 6, 
+    units = "in",
+    res = 300,
+    family = "Arial")
+cxcl10_corplot
+dev.off()
+
+cxcl10_corplot
+```
+   
+### Plot TNFa   
+```{r}
+tnfa_corplot = complete %>% dplyr::filter(display_name == "TNFa") %>% 
+  dplyr::select(tc_pt_study_id, mean_concentration, sample_origin, diagnosis) %>% 
+  unique() %>% 
+  pivot_wider(names_from = sample_origin, values_from = mean_concentration) %>% 
+  ggplot(aes(x = BAL, y = SERUM, color = diagnosis)) + 
+    geom_point() +
+    geom_smooth(method = "lm", se = F) +
+    theme_bw(base_family = "Arial") +
+    labs(x = "BAL", y = "Plasma") +
+    scale_x_continuous(trans = "pseudo_log", 
+                       breaks = c(0, 1e1, 1e2, 1e3, 1e4, 1e5)) +
+    scale_y_continuous(trans = "pseudo_log", 
+                       breaks = c(0, 1e1, 1e2, 1e3, 1e4, 1e5))
+
+CairoPNG("~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/2221027_tnfa_corplot_hm.png",
+    width = 9,
+    height = 6, 
+    units = "in",
+    res = 300,
+    family = "Arial")
+tnfa_corplot
+dev.off()
+
+tnfa_corplot
+```
+   
+## In bulk (all analytes)   
+### Organize data   
+```{r}
+overlapping_samples = intersect(bal$tc_pt_study_id, plasma$tc_pt_study_id)
+
+complete_cor_df = complete %>%
+  dplyr::filter(tc_pt_study_id %in% overlapping_samples) %>% 
+  dplyr::mutate(sample_analyte = paste(tc_pt_study_id, display_name, sep = "_")) %>% 
+  dplyr::select(sample_analyte, mean_concentration, sample_origin) %>% 
+  unique() %>% 
+  pivot_wider(names_from = sample_origin, values_from = mean_concentration) %>% 
+  column_to_rownames("sample_analyte")
+```
+   
+### Stats
+```{r}
+cor.test(complete_cor_df$BAL, complete_cor_df$SERUM, method = "pearson")
+cor.test(log10(complete_cor_df$BAL + 1), log10(complete_cor_df$SERUM + 1), method = "pearson")
+cor.test(complete_cor_df$BAL, complete_cor_df$SERUM, 
+         method = "spearman", exact = T)
+```   
+   
+### Scatterplot   
+```{r}
+ggplot(complete_cor_df, aes(x = BAL, y = SERUM)) +
+  geom_pointdensity() +
+  geom_abline(slope=1, color = "red", linetype = 2) +
+  scale_y_continuous(trans = scales::pseudo_log_trans(), 
+                     breaks = c(0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6)) +
+  scale_x_continuous(trans = scales::pseudo_log_trans(), 
+                     breaks = c(0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6)) +
+  scale_color_viridis() +
+  theme_bw() +
+  theme(axis.text.x = element_text(size = 12),
+        strip.text.x = element_text(size = 24),
+        axis.title.x = element_text(size = 18),
+        axis.title.y = element_text(size = 18)) +
+  labs(x = "[Analyte] in BAL (pg/mL)", y = "[Analyte] in Plasma (pg/mL)")
+```
+   
+## In bulk (excluding obvious problem analytes)   
+### Organize data   
+```{r}
+problem_analytes = c("IL-15", "IL-23", "CCL1", "IL-4", "CCL27",
+                     "CCL11", "CCL13", "CX3CL1", "TGFa", "IL-21",
+                     "TNFa", "IL-7", "EGF", "sCD40L", "CXCL12",
+                     "IFNa2", "IL-1a", "IL-1b", "VEGFa", "CCL22", 
+                     "CCL3", "CCL26")
+
+complete_cor_df = complete %>%
+  dplyr::filter(tc_pt_study_id %in% overlapping_samples &
+                  !(display_name %in% problem_analytes)) %>% 
+  dplyr::mutate(sample_analyte = paste(tc_pt_study_id, display_name, sep = "_")) %>% 
+  dplyr::select(sample_analyte, mean_concentration, sample_origin) %>% 
+  unique() %>% 
+  pivot_wider(names_from = sample_origin, values_from = mean_concentration) %>% 
+  column_to_rownames("sample_analyte")
+```
+   
+### Stats
+```{r}
+cor.test(complete_cor_df$BAL, complete_cor_df$SERUM, method = "pearson")
+cor.test(log10(complete_cor_df$BAL + 1), log10(complete_cor_df$SERUM + 1), method = "pearson")
+cor.test(complete_cor_df$BAL, complete_cor_df$SERUM, 
+         method = "spearman", exact = T)
+```   
+Moderate correlation (even without exclusions) but definitely nonlinear   
+   
+### Scatterplot   
+```{r}
+ggplot(complete_cor_df, aes(x = BAL, y = SERUM)) +
+  geom_pointdensity() +
+  geom_abline(slope=1, color = "red", linetype = 2) +
+  scale_y_continuous(trans = scales::pseudo_log_trans(), 
+                     breaks = c(0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6)) +
+  scale_x_continuous(trans = scales::pseudo_log_trans(), 
+                     breaks = c(0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6)) +
+  scale_color_viridis() +
+  theme_bw() +
+  theme(axis.text.x = element_text(size = 12),
+        strip.text.x = element_text(size = 24),
+        axis.title.x = element_text(size = 18),
+        axis.title.y = element_text(size = 18)) +
+  labs(x = "[Analyte] in BAL (pg/mL)", y = "[Analyte] in Plasma (pg/mL)")
+```
+   
+Moderate improvement, but needs substantial justification.   
+   
+# Other   
+## Biomarker study   
+```{r}
+#these aren't associated with sample origin
+crp_vals = complete %>% 
+  dplyr::select(study_id, tc_pt_study_id, CRP = C_Reactive_Protein) %>% 
+  unique() %>% 
+  group_by(study_id) %>% 
+  dplyr::summarize(CRP_n = sum(!is.na(CRP))) %>% 
+  ungroup()
+
+biomarker_sum = complete %>% 
+  dplyr::filter(display_name %in% c("CXCL10", "TRAIL", "IL-6")) %>% 
+  pivot_wider(names_from = display_name, 
+              values_from = mean_concentration) %>% 
+  dplyr::select(study_id, tc_pt_study_id, diagnosis,
+                day_of_intubation, sample_origin,
+                CXCL10, TRAIL, IL6 = `IL-6`) %>% 
+  unique() %>% 
+  left_join(., crp_vals) %>% 
+  group_by(study_id, diagnosis, CRP_n) %>% 
+  dplyr::summarize(across(.cols = c(CXCL10, TRAIL, IL6),
+                          .fns = list(n_BAL = ~ sum(!(is.na(.x)) & sample_origin == "BAL"),
+                                      n_plasma = ~ sum(!(is.na(.x)) & sample_origin == "SERUM"))),
+                   serial_sampling_BAL = (sum(sample_origin == "BAL") > 1),
+                   serial_sampling_plasma = (sum(sample_origin == "SERUM") > 1)) %>% 
+  ungroup() %>% 
+  dplyr::mutate(all3_BAL = (CXCL10_n_BAL > 0 &
+                              TRAIL_n_BAL > 0 &
+                              CRP_n > 0),
+                all3_plasma = (CXCL10_n_plasma > 0 &
+                              TRAIL_n_plasma > 0 &
+                              CRP_n > 0),
+                all3_both = (CXCL10_n_BAL > 0 &
+                               TRAIL_n_BAL > 0 &
+                               CXCL10_n_plasma > 0 &
+                               TRAIL_n_plasma > 0 &
+                               CRP_n > 0)) %>% 
+  group_by(diagnosis) %>% 
+  dplyr::summarize(across(.cols = matches("^serial|^all3"),
+                          .fns = list(n = ~ sum(.x)))) %>% 
+  ungroup()
+  
+```
+   
+# Alluvial plots   
+## Samples   
+```{r}
+alluvial_data_samples = complete %>% 
+  dplyr::select(study_id, tc_pt_study_id, sample_origin, 
+                Diagnosis = diagnosis) %>% 
+  dplyr::mutate(sample_origin = factor(case_match(sample_origin,
+                                                  "BAL" ~ "BAL",
+                                                  "SERUM" ~ "Plasma"))) %>% 
+  unique()
+
+sample_sum = alluvial_data_samples %>% 
+  group_by(Diagnosis, sample_origin) %>% 
+  dplyr::summarize(n = n()) %>% 
+  ungroup()
+
+alluvial_data_samples = alluvial_data_samples %>% 
+  left_join(., sample_sum)
+
+alluvial_sample = ggplot(alluvial_data_samples, 
+                         aes(x = sample_origin, stratum = Diagnosis, alluvium = tc_pt_study_id,
+                             fill = Diagnosis, label = Diagnosis)) +
+  scale_fill_manual(name = "",
+                    values = diagnosis_pal) +
+  geom_flow() +
+  geom_stratum(width = 0.4) +
+  stat_stratum(geom = "text", aes(label = n), size = 9) +
+  theme_bw(base_family = "Arial") +
+  theme(legend.position = "right",
+        axis.line = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.background=element_blank(),
+        panel.border=element_blank(),
+        panel.grid.major=element_blank(),
+        panel.grid.minor=element_blank(),
+        plot.background=element_blank(),
+        axis.text.x = element_text(size = 24),
+        axis.text.y = element_text(size = 24),
+        axis.title.x = element_text(size = 36),
+        axis.title.y = element_text(size = 36),
+         strip.text = element_text(size = 24),
+        legend.text = element_text(size = 24),
+        legend.key.size = unit(1, 'cm'),
+        title = element_text(size = 36)) +
+  labs(x = "Sample Origin", y = "Number of Samples")
+
+saveRDS(alluvial_sample, "~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/230709_alluvial_data_samples.rds")
+
+alluvial_sample
+```
+
+## Patients   
+```{r}
+alluvial_data_patients = alluvial_data_samples %>% 
+  dplyr::select(-c(tc_pt_study_id, n)) %>% 
+  group_by(study_id, sample_origin) %>% 
+  slice_head() %>% 
+  ungroup()
+
+patient_sum = alluvial_data_patients %>% 
+  group_by(Diagnosis, sample_origin) %>% 
+  dplyr::summarize(n = n()) %>% 
+  ungroup()
+
+alluvial_data_patients = alluvial_data_patients %>% 
+  left_join(., patient_sum)
+
+alluvial_patients = ggplot(alluvial_data_patients, 
+                         aes(x = sample_origin, stratum = Diagnosis, alluvium = study_id,
+                             fill = Diagnosis, label = Diagnosis)) +
+  scale_fill_manual(name = "",
+                    values = diagnosis_pal) +
+  geom_flow() +
+  geom_stratum(width = 0.4) +
+  stat_stratum(geom = "text", aes(label = n), size = 9) +
+  theme_bw(base_family = "Arial") +
+  theme(legend.position = "none",
+        axis.line = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.background=element_blank(),
+        panel.border=element_blank(),
+        panel.grid.major=element_blank(),
+        panel.grid.minor=element_blank(),
+        plot.background=element_blank(),
+        axis.text.x = element_text(size = 24),
+        axis.text.y = element_text(size = 24),
+        axis.title.x = element_text(size = 36),
+        axis.title.y = element_text(size = 36),
+         strip.text = element_text(size = 24),
+        title = element_text(size = 36)) +
+  labs(x = "Sample Origin", y = "Number of Patients")
+
+saveRDS(alluvial_patients, "~/OneDrive - Northwestern University/Cytokine/Analysis/rgrant/230709_alluvial_data_patients.rds")
+
+alluvial_patients
+```

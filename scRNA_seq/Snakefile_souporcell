@@ -1,0 +1,38 @@
+rule all:
+  input:
+    expand("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_batch1/souporcell/{sample}", sample=["SC224", "SC225", "SC233", "SC234", "SC238", "SC239", "SC240", "SC250"])
+  
+rule souporcell:
+  input:
+    "/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_batch1/cellranger/{sample}"
+  output:
+    directory("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_batch1/souporcell/{sample}")
+  params:
+    slurm__hours=12,
+    slurm__cores=12,
+    slurm__mem=80
+  shell:
+    """
+    module purge all
+    module load singularity
+    
+    gunzip -c /projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_batch1/cellranger/{wildcards.sample}/outs/filtered_feature_bc_matrix/barcodes.tsv.gz > \
+    /projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_batch1/cellranger/{wildcards.sample}/outs/filtered_feature_bc_matrix/barcodes.tsv
+    
+    sif=/projects/b1038/Pulmonary/rgrant/resources/souporcell/souporcell_latest.sif
+    vcf=/projects/b1038/Pulmonary/rgrant/resources/souporcell/common_variants_grch38.vcf
+    
+    singularity exec \
+    --bind /projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_batch1/:/data \
+    --bind $vcf \
+    --bind /projects/b1038/tools/refdata-cellranger-GRCh38-3.0.0:/ref-genome \
+    $sif souporcell_pipeline.py \
+    -i /data/cellranger/{wildcards.sample}/outs/possorted_genome_bam.bam \
+    -b /data/cellranger/{wildcards.sample}/outs/filtered_feature_bc_matrix/barcodes.tsv \
+    -f /ref-genome/fasta/genome.fa \
+    --common_variants $vcf \
+    -t 12 \
+    -o /data/souporcell/{wildcards.sample} \
+    -k 2 \
+    -p 2
+    """

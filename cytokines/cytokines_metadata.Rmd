@@ -1,0 +1,1028 @@
+---
+title: "Script Cytokines Metadata"
+output: html_notebook
+---
+   
+# Setup   
+## Load packages   
+```{r setup}
+library(ggplot2)
+library(Cairo)
+library(ggsci)
+library(ggsignif)
+library(googlesheets4)
+library(googledrive)
+library(gtools)
+library(tidyverse)
+library(readxl)
+library(lubridate)
+library(pheatmap)
+library(RColorBrewer)
+library(patchwork)
+library(qwraps2)
+source("~/Documents/GitHub/COVID19_BAL_flow/rgrant/200919_code_pathogens.R")
+source("~/Documents/GitHub/COVID19_BAL_flow/rgrant/200919_correct_endpoints.R")
+
+mean_sd = function(x){
+  return(mean_sdl(x, mult = 1))
+}
+#actually the pal for all plots
+pal = pal_npg("nrc")(9)
+
+set.seed(12345)
+```
+
+## Google login   
+```{r}
+drive_auth(use_oob = T, cache = T, email = XXXXX) 
+gs4_auth(token = drive_token(), use_oob = T, cache = T, email = XXXXX)
+```
+
+
+## Import Sasha's data analysis results   
+```{r message=FALSE, warning=FALSE}
+flow_data = read_excel("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/20200707_COVID_SCRIPT_5L_Aria.xlsx",
+                        trim_ws = T,
+                        .name_repair = "universal",
+                        sheet = "cleaned",
+                  col_types = c("text", "text", rep("numeric", 12))) %>% 
+  as.data.frame() %>% 
+  dplyr::mutate(panel = "new")
+prior_data = read_excel("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/20200701_Pre-COVID_SCRIPT_6L_Aria.xlsx",
+                        trim_ws = T,
+                        .name_repair = "universal",
+                        sheet = "cleaned",
+                  col_types = c("text", "text", rep("numeric", 12))) %>% 
+  as.data.frame() %>% 
+  dplyr::mutate(panel = "old")
+flow_data = smartbind(flow_data, prior_data)
+
+#remove in-progress entries
+flow_data = subset(flow_data, !is.na(Sample))
+
+#mark neutrophilic patients
+flow_data$neutrophilic = factor(ifelse(flow_data$percent_neutrophils >= 50,
+                                  yes = "Neutrophilic",
+                                  no = "Non-Neutrophilic"))
+
+#adjust types
+flow_data$ID = as.character(flow_data$ID)
+flow_data$panel = factor(flow_data$panel)
+```
+
+## Import RNA extraction metadata   
+```{r}
+rna_metadata = read_sheet(XXXXX,
+                          trim_ws = T,
+                          .name_repair = "universal", 
+                          sheet = "SCRIPT_01 RNAseq Metadata",
+                          na = c("", "NA"))
+#clean up colnames
+colnames(rna_metadata) = gsub("\\.", "_", colnames(rna_metadata)) #I like underscores
+colnames(rna_metadata) = gsub("_+$", "", colnames(rna_metadata)) # remove trailing
+colnames(rna_metadata) = gsub("_+", "_", colnames(rna_metadata)) #remove dup underscores
+#tube is randomly read in as a list. fix this.
+rna_metadata$tubeid_macrophRNA = as.character(rna_metadata$tubeid_macrophRNA)
+rna_metadata$tubeid_macrophRNA[rna_metadata$tubeid_macrophRNA == "NULL"] = NA
+#take out problem cols (added back)
+rna_metadata = rna_metadata %>% 
+  dplyr::select(-c(RNAseq_batch, Batch_sample))
+#remove preceding zeros
+rna_metadata = rna_metadata %>% 
+  mutate_at("tubeid_macrophRNA", function(x){ gsub("^0", "", x) })
+#fix dates
+rna_metadata$sample_process_dt = as.Date(rna_metadata$sample_process_dt)
+
+#merge with flow data
+flow_data$BAL_sample = substring(flow_data$Sample, 10, 20)
+flow_data = left_join(flow_data, 
+                 rna_metadata, 
+                 by = c("BAL_sample" = "tc_pt_study_id"),
+                 na_matches = "never")
+```
+
+
+## Import clinical metadata   
+```{r}
+#updated 2022-08-16
+edw_endpoints = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/220816 SCRIPT Basic Endpoints.csv",
+                     
+                         strip.white = T,
+                         check.names = T,
+                         na.strings = c("", "NA"))
+date_cols = colnames(edw_endpoints)[grepl("date|_dt|_intub_", colnames(edw_endpoints), ignore.case = T)]
+edw_endpoints = edw_endpoints %>%
+  mutate_at(.vars = date_cols,
+            .funs = function(x){
+              as.Date(x, format = "%m/%d/%Y %H:%M", tz = "CST") }) %>% 
+  mutate(pt_study_id = as.character(pt_study_id)) %>% 
+  dplyr::mutate(binned_outcome = case_when(discharge_disposition_name == "Expired" ~ "Deceased",
+                                             grepl("^home|Elopement|Shelter|Custodial", 
+                                                   discharge_disposition_name, 
+                                                   ignore.case = T) ~ "Home",
+                                           grepl("hospice", discharge_disposition_name) ~ "Hospice",
+                                             discharge_disposition_name %in% 
+                                             c("Acute Care Hospital",
+                                               "Inpatient Hospice",
+                                               "Skilled Nursing Facility or Subacute Rehab Care",
+                                               "Acute Inpatient Rehabilitation",
+                                               "Planned Readmission – DC/transferred to acute inpatient rehab") ~ 
+                                               "Inpatient Facility",
+                                             discharge_disposition_name == "Long-Term Acute Care Hospital (LTAC)" ~ "LTAC",
+                                             TRUE ~ "Other")) %>% 
+  select(-c(full_name, consent_dt)) %>% 
+  unique()
+
+
+#updated 2022-08-16
+#add EDW molecular data and give script IDs
+edw_molecular = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/220816 SCRIPT and COVID BAL Results.csv",
+                     
+                         na.strings = c("", "NA"),
+                         strip.white = T,
+                         skip = 2,
+                         check.names = T) %>% 
+  select(-Name) %>% 
+  dplyr::mutate(MRN = as.character(MRN)) 
+  
+mrn_conv = edw_molecular %>% 
+  dplyr::select(ir_id, MRN)
+#make numeric values numeric   
+numeric_cols = c("day_of_intubation", "day_of_hospitalization", "RBC_BODY_FLUID", "WBC__BODY_FLUID", "NEUTROPHILS__BODY_FLUID",
+                 "Absolute_Neutrophils", "TOXIC_GRANULATION", "MACROPHAGE_BF", "MONOCYTE_BF", "LYMPH_BF", 
+                 "ABSOLUTE_LYMPHOCYTES", "EOSINOPHILS__BODY_FLUID", "ABSOLUTE_EOSINOPHILS", "PLASMA_CELL_BF",
+                 "OTHER_CELLS__BODY_FLUID", "AMYLASE_BF", "WHITE_BLOOD_CELL_COUNT", 
+                 "C_Reactive_Protein", "LDH", "CREATINE_KINASE__TOTAL", "PROCALCITONIN", "FERRITIN", "TROPONIN_I",
+                 "Creatinine", "AST__SGOT_", "D_DIMER", "max_daily_temp")
+edw_molecular = edw_molecular %>% mutate_at(.vars = numeric_cols, .funs = function(x){
+  x = gsub(">", "", x)
+  x = gsub("<.+", "0", x)
+  x = gsub(",", "", x)
+  x = as.numeric(x)
+  return(x)})
+
+#remove one strange duplicate entry
+edw_molecular = subset(edw_molecular, !(duplicated(edw_molecular$order_accession_num)))
+
+#clean up pathogen data reliably
+edw_molecular = edw_molecular %>% 
+  rename(ASPERGILLUS_GALACTOMANNAN_ANTIGEN_NMH_LFH = ASPERGILLUS_GALACTOMANNAN_ANTIGEN_NMH_LFH_) #differences with MS2
+edw_molecular = code_pathogens(edw_molecular)
+edw_molecular$order_accession_num = as.character(edw_molecular$order_accession_num)
+
+#fix dates
+date_cols = colnames(edw_molecular)[grepl("date", colnames(edw_molecular), ignore.case = T)]
+edw_molecular = edw_molecular %>% 
+  mutate_at(.vars = date_cols, .funs = function(x){
+    as.Date(x, format = "%m/%d/%Y", tz = "CST")} )
+
+#reformat order timestamps for merging with blood gas
+edw_molecular$BAL_order_timestamp = as.POSIXct(edw_molecular$BAL_order_timestamp,
+                                               format = "%m/%d/%Y %X %p", 
+                                               tz = "America/Chicago")
+#updated 2022-08-16
+#import known COVID patients and all patient IDs from Marjorie's master list
+covid_cases = xlsx::read.xlsx("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/220816 SCRIPT_Enrollment_Log_August 2022.xlsx", 
+                              password = XXXXX,
+                              sheetIndex = 1) %>% 
+  dplyr::filter(COVID.19..Y.N.or.R.O. == "Y") %>% 
+  dplyr::select(study_id = NA., clarity.west.mrn = MRN) %>% 
+  dplyr::mutate(clarity.west.mrn = trimws(gsub("\\:", "", clarity.west.mrn)),
+                covid_confirmed = TRUE) 
+
+#import all patient data for script
+#updated 2022-08-16
+all_patients = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/220816 STU00204868_subjects_08_16_2022.csv",
+                     
+                        na.strings = c("", "NA"),
+                        strip.white = T,
+                        check.names = T, 
+                        colClasses = rep("character", 10)) %>% 
+  separate_rows(case.number, sep = ", ")  %>% #uncollapse ID column
+  dplyr::select(-diagnosis)
+
+#updated 2022-08-16
+#import conversion from SCRIPT BAL ID to NMH accession number and add to molecular
+accession_conv = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/220816_RAG U19SCRIPTVersion40-AccessionNumberConve_DATA_2022-08-16_1040.csv",
+                     
+                          na.strings = c("", "NA", "n/a", "N/A", "na"), 
+                          strip.white = T) %>% 
+  na.omit() %>% 
+  dplyr::mutate(accession_num = gsub("-", "", accession_num)) %>%  #match destination formatting
+  dplyr::mutate(study_id = substring(bal_barcode, 1, 4),
+                bal_dt = as.Date(bal_dt)) %>% 
+  dplyr::filter(grepl("\\d{4}-BAL-\\d{2}", bal_barcode)) %>% #remove bad entries 
+  dplyr::select(bal_barcode, accession_num, study_id, bal_dt) %>% 
+  unique()
+colnames(accession_conv) = c("tc_pt_study_id", "order_accession_num", "study_id", "bal_date")
+accession_conv$order_accession_num = trimws(accession_conv$order_accession_num) #not clear why this is necessary, but it is
+
+#pull in manual edits for entry errors
+bal_edits = read_excel("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/201014_missing_accession_numbers_final.xlsx") %>% 
+  mutate(bal_date = as.Date(bal_date, origin = "1899-12-30"))
+discards = bal_edits$tc_pt_study_id[bal_edits$action == "discard"]
+accession_conv = subset(accession_conv, !(tc_pt_study_id %in% discards)) #these will then get removed from EDW data without a bal number
+#recode incorrect entries
+recodes = bal_edits$tc_pt_study_id[bal_edits$action == "update"]
+for(i in 1:nrow(accession_conv))
+{
+  cur_bal = accession_conv$tc_pt_study_id[i]
+  if(cur_bal %in% recodes)
+  {
+    accession_conv$order_accession_num[i] = bal_edits$correct_number[bal_edits$tc_pt_study_id == cur_bal]
+    accession_conv$bal_date[i] = bal_edits$bal_date[bal_edits$tc_pt_study_id == cur_bal]
+  }
+}
+#add missing entries
+keepers = bal_edits %>% 
+  dplyr::filter(action == "keep") %>% 
+  dplyr::select(tc_pt_study_id, order_accession_num = correct_number, 
+                study_id, bal_date) %>% 
+  mutate(order_accession_num = as.character(order_accession_num),
+         study_id = as.character(study_id))
+accession_conv = bind_rows(accession_conv, keepers) %>% 
+  dplyr::filter(order_accession_num != "see comments")
+
+edw_molecular = left_join(edw_molecular, accession_conv, by = c("order_accession_num"),
+                          na_matches = "never")
+
+#add in auxora data
+auxora_conv = read.csv("~/Documents/GitHub/2021-auxora/04integration/samples-v4.csv", check.names = F) %>% 
+  dplyr::select(`Study ID`:`Study cohort`) %>% 
+  unique() %>% 
+  #add auxora version of BAL number (1:n)
+  dplyr::arrange(`Study ID`, `BAL day`) %>% 
+  group_by(`Study ID`) %>% 
+  dplyr::mutate(auxora_index = row_number()) %>% 
+  ungroup() %>% 
+  dplyr::mutate(`BAL day` = sprintf("%02d", `BAL day`),
+                `Study ID` = as.character(`Study ID`),
+                auxora_id = paste0(XXXXX, sprintf("%02d", as.numeric(gsub("AUX_", "", `Study ID`))), "_BAL-", auxora_index),
+                tc_pt_study_id = ifelse(is.na(`SCRIPT ID`),
+                                        yes = auxora_id,
+                                        no = paste0(`SCRIPT ID`, "-BAL-", `BAL day`))) %>% 
+    group_by(`Study ID`) %>% 
+  dplyr::mutate(auxora_dpt = as.numeric(`BAL day`) - min(as.numeric(`BAL day`))) %>% 
+  ungroup() %>% 
+  dplyr::select(auxora_group = Drug, auxora_timepoint_group = `Study cohort`,
+                auxora_treatment_stage = `Baseline`, tc_pt_study_id, auxora_id,
+                auxora_dpt) %>% 
+  dplyr::mutate(across(auxora_group:auxora_treatment_stage, .fns = factor),
+                study_id = substring(tc_pt_study_id, 1, regexpr("BAL", tc_pt_study_id) - 2))
+
+edw_molecular = full_join(edw_molecular, auxora_conv, na_matches = "never")
+
+# some BAL samples do not have EDW entries. Add in from rna metadata, endpoints, and flow
+edw_molecular$script_day = as.numeric(substring(edw_molecular$tc_pt_study_id, 
+                                     nchar(edw_molecular$tc_pt_study_id) - 1)) #useful below
+
+flow_and_bulk = unique(c(rna_metadata$tc_pt_study_id,
+                  flow_data$BAL_sample))
+missing_samples = base::setdiff(flow_and_bulk,
+                                edw_molecular$tc_pt_study_id)
+missing_samples = missing_samples[grepl("\\d{4}-BAL-\\d{2}", missing_samples)]
+missing_sample_df = data.frame(study_id = substring(missing_samples, 1, 4),
+                               tc_pt_study_id = missing_samples)
+missing_sample_df = edw_molecular %>% 
+  dplyr::mutate(first_bal_date = as.Date(BAL_order_date) - script_day) %>% 
+  dplyr::select(ir_id:hosp_disch_date, study_id, first_bal_date) %>% 
+  dplyr::filter(!is.na(ir_id)) %>% #empties
+  unique() %>% 
+  left_join(missing_sample_df, .,
+            by = "study_id",
+            na_matches = "never") %>% 
+  group_by(study_id) %>% 
+  dplyr::mutate(first_bal_date = min(first_bal_date)) %>% #at most +/- 1 day
+  ungroup() %>% 
+  unique() %>%
+  dplyr::mutate(BAL_order_date = first_bal_date + as.numeric(substring(tc_pt_study_id,
+                                                                nchar(tc_pt_study_id) - 1)),
+         day_of_intubation = as.numeric(difftime(BAL_order_date, first_intubation_date, units = "days"))) %>% 
+  select(-first_bal_date)
+edw_molecular = bind_rows(edw_molecular, missing_sample_df)
+
+#updated 2022-08-16
+#import pneumonia diagnosis
+#switched to BDS version 2022-08-16
+diagnosis = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/220816 U19SCRIPTVersion40-PneumoniaDiagnosisBD_DATA_2022-08-16_1057.csv", 
+                     
+                     na.strings = c("", "NA"),
+                     strip.white = T,
+                     check.names = T) %>% 
+  dplyr::filter(!is.na(pt_category)) %>% 
+  dplyr::select(record_id, pt_category:clin_hap) %>% 
+  dplyr::mutate(pneu_assess_dt = as.Date(pneu_assess_dt)) %>% 
+  unique() %>% 
+  arrange(record_id, pneu_assess_dt)
+
+#updated 2022-08-16
+record_id_conv = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/220816 U19SCRIPTVersion40-RecordIDConversion_DATA_2022-08-16_1044.csv", 
+                     
+                          na.strings = c("", "NA"),
+                          strip.white = T,
+                          check.names = T) %>% 
+  dplyr::filter(!is.na(pt_study_id)) %>% 
+  dplyr::select(record_id, pt_study_id) %>% 
+  unique()
+
+diagnosis_conv = data.frame(pt_category = c(1:4),
+                            diagnosis = factor(c("CAP", "HAP", "VAP", "Non-Pneumonia Control")),
+                            simplified_diagnosis = factor(c(rep("Pneumonia", 3), "Non-Pneumonia Control")))
+
+diagnosis = full_join(diagnosis, record_id_conv, by = "record_id", na_matches = "never") %>% 
+  left_join(., diagnosis_conv, by = "pt_category", na_matches = "never") %>% 
+  dplyr::select(-record_id) %>% 
+  group_by(pt_study_id) %>% 
+  dplyr::mutate(study_dates = list(as.character(pneu_assess_dt)), 
+         diagnoses = list(as.character(diagnosis)),
+         simplified_diagnoses = list(as.character(simplified_diagnosis)),
+         pt_categories = list(pt_category),
+         ever_pna = any(simplified_diagnosis == "Pneumonia", na.rm = T)) %>% 
+  ungroup() %>% 
+  unique()
+#all patients with multiple diagnoses go from control --> some type of pneumonia (makes sense)
+#so best practice is probably to code these cases as control for all samples until PNA, then always PNA
+#for patients with multiple PNA types, just always code as PNA (current scheme is to bin all PNA for now)
+#for patients with 1 diagnosis, just pick all BAL
+pts = c()
+assoc_bal = c()
+simp = c()
+pneu_assess_dt = c()
+for(patient in unique(diagnosis$pt_study_id))
+{
+  diagnoses = subset(diagnosis, pt_study_id == patient)$diagnosis
+  
+  #for consistent pna patients, link all samples
+  if(!("Non-Pneumonia Control" %in% diagnoses))
+  {
+    bal_samples = sort(subset(edw_molecular, study_id == patient)$tc_pt_study_id)
+    pts = append(pts, rep(patient, length(bal_samples)))
+    simp = append(simp, rep("Pneumonia", length(bal_samples)))
+    assoc_bal = append(assoc_bal, bal_samples)
+  } else #i.e. if at least one control diagnosis
+  {
+    if(length(diagnoses) == 1)
+    {
+      bal_samples = sort(subset(edw_molecular, study_id == patient)$tc_pt_study_id)
+      pts = append(pts, rep(patient, length(bal_samples)))
+      simp = append(simp, rep("Non-Pneumonia Control", length(bal_samples)))
+      assoc_bal = append(assoc_bal, bal_samples)
+    } else #split by diagnosis date. May be hazy in the middle, but still better
+    {
+      first_pna = min(subset(diagnosis, pt_study_id == patient & diagnosis != "Non-Pneumonia Control")$pneu_assess_dt)
+      control_bal_samples = sort(subset(edw_molecular, study_id == patient & BAL_order_date < first_pna)$tc_pt_study_id)
+      pna_bal_samples = sort(subset(edw_molecular, study_id == patient & BAL_order_date >= first_pna)$tc_pt_study_id)
+      pts = append(pts, rep(patient, (length(control_bal_samples) + length(pna_bal_samples))))
+      simp = append(simp, c(rep("Non-Pneumonia Control", length(control_bal_samples)),
+                            rep("Pneumonia", length(pna_bal_samples))))
+      assoc_bal = append(assoc_bal, c(control_bal_samples, pna_bal_samples))
+    }
+  }
+}
+
+bal_diagnoses = edw_molecular %>% 
+  dplyr::select(tc_pt_study_id, BAL_order_date) %>% 
+  right_join(., data.frame(pt_study_id = pts,
+                           simplified_diagnosis = simp,
+                           tc_pt_study_id = assoc_bal))
+
+#match BALs with PNA assessments
+pneu_assess_dt = vector(mode = "character", length = nrow(bal_diagnoses))
+for(i in 1:nrow(bal_diagnoses))
+{
+  cur_pt = bal_diagnoses$pt_study_id[i]
+  cur_bal = bal_diagnoses$tc_pt_study_id[i]
+  cur_bal_date = bal_diagnoses$BAL_order_date[i]
+  sub = diagnosis %>% 
+    dplyr::filter(pt_study_id == cur_pt) %>% 
+    mutate(timediff = abs(difftime(pneu_assess_dt, cur_bal_date, units = "days")))
+  if(nrow(sub) == 1)
+  {
+    pneu_assess_dt[i] = as.character(sub$pneu_assess_dt[1])
+  } else if(all(is.na(sub$pneu_assess_dt)) | is.na(cur_bal_date))
+  {
+    pneu_assess_dt[i] = NA
+  } else
+  {
+    pneu_assess_dt[i] = as.character(unique(sub$pneu_assess_dt[which.min(sub$timediff)]))
+  }
+}
+bal_diagnoses$pneu_assess_dt = as.Date(pneu_assess_dt)
+
+#for rendering unique patients for stats later
+diagnosis_for_pt_data = diagnosis %>% 
+  dplyr::select(-c(diagnosis, pt_category, pneu_assess_dt, simplified_diagnosis)) %>% 
+  unique() %>% 
+  dplyr::filter(!duplicated(pt_study_id)) #unique doesn't work on list cols
+
+#updated 2022-08-16
+ir_conversion = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/220816 SCRIPT_ID_irid.csv") %>% 
+  dplyr::rename(study_id = pt_study_id, ir_id = patient_ir_id) %>% 
+  dplyr::mutate(study_id = as.numeric(study_id))
+covid_cases$clarity.west.mrn = as.character(covid_cases$clarity.west.mrn)
+patient_data = full_join(covid_cases,
+                         all_patients,
+                         by = c("clarity.west.mrn" = "nmhc_record_number"),
+                         na_matches = "never") %>% 
+  dplyr::mutate(case.number = as.integer(case.number)) %>% 
+  select(-c(first.name, last.name, address.line.1:email, nmff_record_number, nmh_record_number)) %>% 
+  #some only have one or the other, both are consistent otherwise
+  mutate(study_id = ifelse(is.na(study_id),
+                           yes = case.number,
+                           no = study_id))
+patient_data = left_join(patient_data, ir_conversion)
+#import later adjudications
+chichi_covid = read_excel("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/200927_adjudication_data_CP_edit.xlsx", na = c("", "NA")) %>% 
+  mutate(covid_confirmed = case_when(`Covid Status` == "covid" ~ TRUE,
+                                     is.na(`Covid Status`) ~ FALSE))
+for(i in 1:nrow(patient_data))
+{
+  if(!(patient_data$clarity.west.mrn[i] %in% covid_cases$clarity.west.mrn) &
+     patient_data$study_id[i] %in% chichi_covid$study_id)
+  {
+    patient_data$covid_confirmed[i] = chichi_covid$covid_confirmed[chichi_covid$study_id == patient_data$study_id[i]]
+  }
+}
+
+diagnosis = diagnosis %>% 
+  dplyr::select(-c(diagnoses, study_dates, simplified_diagnoses, pt_categories, ever_pna)) %>% 
+  dplyr::select(-c(diagnosis, pt_category)) %>%  #keep only simple (other data preserved later)
+  left_join(., bal_diagnoses) %>% 
+  unique()
+
+#bind with molecular
+diagnosis = diagnosis %>% 
+  mutate(pt_study_id = as.character(pt_study_id)) %>% 
+  dplyr::select(-c(BAL_order_date, pneu_assess_dt)) 
+  
+edw_molecular = left_join(edw_molecular, 
+                          diagnosis,
+                          by = c("study_id" = "pt_study_id",
+                                 "tc_pt_study_id"),
+                          na_matches = "never")
+
+#updated 2022-08-16
+#import smoker status data
+smoking_codes = data.frame(pt_smoker = c(0, 1, 2),
+                           smoking_status = factor(c("Never Smoker", "Current Smoker", "Past Smoker")))
+smoking_data = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/220816 U19SCRIPTVersion40-SmokerStatus_DATA_2022-08-16_1110.csv",
+                     
+                        na.strings = c("", "NA", "n/a", "N/A", "na"),
+                        strip.white = T) %>% 
+  dplyr::mutate(pt_study_id = as.character(pt_study_id)) %>% 
+  dplyr::filter(!is.na(pt_study_id)) %>% 
+  left_join(., smoking_codes, by = "pt_smoker", na_matches = "never") %>% 
+  dplyr::mutate(smoke_pk_day = as.numeric(gsub("1/2", "0.5", smoke_pk_day)))
+smoking_data$pack_years = ifelse(smoking_data$smoking_status == "Past Smoker",
+                                 yes = smoking_data$former_smoke_pk_yrs,
+                                 no = (smoking_data$smoke_pk_day * smoking_data$smoke_years))
+edw_endpoints = left_join(edw_endpoints, smoking_data, by = "pt_study_id",
+                          na_matches = "never")
+
+#updated 2022-08-16
+#import BMI data   
+bmi_data = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/220816_RAG SCRIPT BMI data.csv",
+                     
+                    na.strings = c("", "NA", "n/a", "N/A", "na"),
+                    strip.white = T)
+
+#updated 2022-08-16
+#import SOFA scores
+#also includes unique stays!
+sofa_data = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/220816 SCRIPT Serial SOFA Score.csv",
+                    
+                     strip.white = T,
+                     check.names = T,
+                     na.strings = c("", "NA", "n/a", "N/A", "na"))
+date_cols = setdiff(colnames(sofa_data)[grepl("date|day|dt", colnames(sofa_data), ignore.case = T)],
+                    c("ICU_Day"))
+sofa_data = sofa_data %>% 
+  mutate_at(.vars = date_cols, .funs = function(x){ as.Date(x, format = "%m/%d/%Y", tz = "CST") }) %>% 
+  dplyr::select(-c(MRN, admission_datetime, discharge_datetime)) #remove duplicates
+
+#updated 2022-08-16
+aps_data = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/220816 SCRIPT Serial APS Score.csv",
+                    
+                     strip.white = T,
+                     check.names = T,
+                     na.strings = c("", "NA", "n/a", "N/A", "na"))
+date_cols = setdiff(colnames(aps_data)[grepl("date|day|dt", colnames(aps_data), ignore.case = T)],
+                    c("icu_day"))
+aps_data = aps_data %>% 
+  mutate_at(.vars = date_cols, .funs = function(x){ as.Date(x, format = "%m/%d/%Y", tz = "CST") }) %>% 
+  dplyr::select(-c(MRN, admission_datetime, discharge_datetime)) #remove duplicates
+
+#actually can allow NA matches here
+sofa_data = full_join(sofa_data, 
+                      suffix = c("_SOFA", "_APS"),
+                      aps_data,
+                      by = c("pt_study_id", "icu_rank",
+                             "icu_start_dt", "icu_stop_dt", "day_bucket_starts", "day_bucket_ends", 
+                             "bilirubin", "creatinine", "visit_id" = "visit_key", "ICU_Day" = "icu_day"), )
+
+#join by date range for each associated BAL
+merge_dates = data.frame(pt_study_id = c(),
+                         visit_id = c(),
+                         ICU_Day = c(),
+                         day_bucket_starts = c(),
+                         day_bucket_ends = c(),
+                         merge_date = c())
+for(i in 1:nrow(sofa_data))
+{
+  pt = sofa_data$pt_study_id[i]
+  visit = sofa_data$visit_id[i]
+  ICU_Day = sofa_data$ICU_Day[i]
+  min_date = sofa_data$day_bucket_starts[i]
+  max_date = sofa_data$day_bucket_ends[i]
+  cor_BAL = subset(edw_molecular, study_id == pt &
+                     BAL_order_date >= min_date &
+                     BAL_order_date <= max_date)
+  rows_out = data.frame(pt_study_id = rep(pt, nrow(cor_BAL)),
+                        visit_id = rep(visit, nrow(cor_BAL)),
+                        ICU_Day = rep(ICU_Day, nrow(cor_BAL)),
+                        day_bucket_starts = rep(min_date, nrow(cor_BAL)),
+                        day_bucket_ends = rep(max_date, nrow(cor_BAL)),
+                        merge_date = cor_BAL$BAL_order_date)
+  merge_dates = rbind(merge_dates, rows_out)
+}
+sofa_data_for_edw_molecular = left_join(sofa_data, merge_dates) #for merging into total metadata, any downstream
+#join with patient data without duplicating data
+#and isolate first score
+sofa_data_for_patient_data = sofa_data %>% 
+  dplyr::select(-enrollment_dt1) %>% 
+  arrange(pt_study_id, visit_id, icu_rank, ICU_Day) %>% 
+  group_by(pt_study_id, visit_id) %>%
+  dplyr::summarize(earliest_sofa = first(SOFA), 
+         mean_sofa = mean(SOFA, na.rm = T),
+         median_sofa = median(SOFA, na.rm = T),
+         earliest_aps = first(total_APS_score_num), 
+         mean_aps = mean(total_APS_score_num, na.rm = T), 
+         median_aps = median(total_APS_score_num, na.rm = T))
+#merge with patient data
+patient_data = left_join(patient_data, 
+                         sofa_data_for_patient_data,
+                         by = c("study_id" = "pt_study_id"),
+                         na_matches = "never")
+
+#remove duplicate columns
+patient_data = patient_data %>% 
+  dplyr::select(-case.number) %>% 
+  unique()
+
+#updated 2022-08-16
+#import ventilator settings   
+vent_settings = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/220816 Ventilator settings.csv",
+                     
+                     strip.white = T,
+                     check.names = T,
+                     na.strings = c("", "NA", "n/a", "N/A", "na")) %>% 
+  dplyr::select(ir_id, meas_date, disp_name, meas_value) %>% 
+  dplyr::mutate(meas_date = as.Date(meas_date, format = "%m/%d/%Y", tz = "CST")) %>% 
+  pivot_wider(names_from = disp_name, 
+              values_from = meas_value, 
+              names_repair = "universal")
+numeric_cols = colnames(vent_settings)[c(3:12, 14)]
+vent_settings = vent_settings %>%
+  mutate_at(.vars = numeric_cols, .funs = as.numeric) %>% #fix non-numeric cols
+  dplyr::mutate(driving_pressure = Plateau.Pressure - PEEP)
+#make single IBW/kg column
+vent_settings$IBW_kg = ifelse(is.na(vent_settings$IBW.kg..Calculated..MALE),
+                               yes = vent_settings$IBW.kg..Calculated..FEMALE,
+                               no = vent_settings$IBW.kg..Calculated..MALE)
+
+#updated 2022-08-16
+#import blood gases
+blood_gas = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/220816 NMH COVID pos ventilated or SCRIPT patient blood gases.csv",
+                     
+                     strip.white = T,
+                     check.names = T,
+                     na.strings = c("", "NA", "n/a", "N/A", "na")) %>% 
+  dplyr::select(ir_id, order_datetime, NAME, value_numeric) %>% 
+  dplyr::mutate(order_datetime = as.POSIXct(order_datetime, format = "%m/%d/%Y %X %p", tz = "America/Chicago")) %>% 
+  pivot_wider(names_from = NAME, 
+              values_from = value_numeric, 
+              names_repair = "universal",
+              values_fn = mean)
+#determine closest realistic BAL order date (if any)   
+#setting a max of 24hrs for now
+blood_gas$merge_datetime = NA
+for(i in 1:nrow(edw_molecular))
+{
+  cur_bal = edw_molecular[i, ]
+  possible_bloodgas = blood_gas %>% 
+    dplyr::filter(ir_id == cur_bal$ir_id) %>% 
+    dplyr::mutate(timediff = difftime(cur_bal$BAL_order_timestamp, order_datetime, tz = "America/Chicago", units = "hours")) %>% 
+    dplyr::filter(timediff < 24 & timediff >= 0)
+  if(nrow(possible_bloodgas) == 0)
+  {
+    blood_gas$merge_datetime[i] = NA
+  } else
+  {
+    closest = possible_bloodgas[which.min(possible_bloodgas$timediff), ]
+    blood_gas$merge_datetime[blood_gas$ir_id == closest$ir_id & blood_gas$order_datetime == closest$order_datetime] = as.character(cur_bal$BAL_order_timestamp)
+  }
+}
+blood_gas$merge_datetime = as.POSIXct(blood_gas$merge_datetime, tz = "America/Chicago")
+
+#merge metadata
+edw_molecular$ir_id = as.character(edw_molecular$ir_id)
+edw_endpoints$ir_id = as.character(edw_endpoints$ir_id)
+bmi_data$ir_id = as.character(bmi_data$ir_id)
+patient_data$study_id = as.character(patient_data$study_id)
+patient_data$ir_id = as.character(patient_data$ir_id)
+sofa_data_for_edw_molecular$pt_study_id = as.character(sofa_data_for_edw_molecular$pt_study_id)
+edw_molecular$MRN = as.character(edw_molecular$MRN)
+vent_settings$ir_id = as.character(vent_settings$ir_id)
+blood_gas$ir_id = as.character(blood_gas$ir_id)
+complete_bal_data = full_join(edw_molecular, 
+                           subset(patient_data, !is.na(study_id)),
+                           by = c("study_id"), 
+                           na_matches = "never") %>%
+  select(-c(MRN)) %>% 
+  #fix missing ir ids
+  dplyr::select(-ir_id.x) %>% 
+  dplyr::rename(ir_id = ir_id.y) %>% 
+  full_join(.,
+            edw_endpoints,
+            by = c("ir_id", "study_id" = "pt_study_id"),
+            na_matches = "never") %>% 
+  select(-west_mrn) %>% 
+  left_join(., bmi_data, by = "ir_id", na_matches = "never") %>% 
+  left_join(., vent_settings, by = c("ir_id", "BAL_order_date" = "meas_date"), na_matches = "never")  %>% 
+  left_join(., blood_gas, by = c("ir_id", "BAL_order_timestamp" = "merge_datetime"), na_matches = "never")
+
+#fix colnames
+colnames(flow_data) = gsub("\\.", "_", colnames(flow_data)) #I like underscores
+colnames(flow_data) = gsub("_+$", "", colnames(flow_data)) # remove trailing
+colnames(flow_data) = gsub("^_+", "", colnames(flow_data)) # remove leading
+colnames(flow_data) = gsub("_+", "_", colnames(flow_data)) #remove dup underscores
+colnames(complete_bal_data) = gsub("\\.", "_", colnames(complete_bal_data)) 
+colnames(complete_bal_data) = gsub("_+$", "", colnames(complete_bal_data)) 
+colnames(complete_bal_data) = gsub("^_+", "", colnames(complete_bal_data))
+colnames(complete_bal_data) = gsub("_+", "_", colnames(complete_bal_data))
+   
+#add in healthy controls, which have no associated metadata
+#no need to clean this as I put it together
+healthy_metadata = read.csv("~/OneDrive - Northwestern University/Rogan/RGrant/SCRIPT/200717_healthy_control_metadata.csv",
+                     
+                            colClasses = c("character", "character", "numeric",
+                                           "character", "logical", "character",
+                                           "character", "character"))
+
+complete_bal_data = bind_rows(complete_bal_data, healthy_metadata) %>% 
+  #derive additional metadata
+  dplyr::mutate(PF_ratio = PO2_ART / FiO2,
+                days_from_death = as.numeric(difftime(BAL_order_date, death_date, units = "days")),
+                #all auxora had covid
+                covid_confirmed = factor(case_when(!is.na(auxora_id) | covid_confirmed == TRUE ~ TRUE,
+                                            TRUE ~ FALSE)),
+                day_of_intubation = as.numeric(difftime(BAL_order_date, first_intubation_date, units = "days")),
+                days_intube_prior_enroll_redcap = case_when(days_intube_prior_enroll_redcap > 100 ~ Inf,
+                                                            is.na(days_intube_prior_enroll_redcap) ~ 0,
+                                                            TRUE ~ days_intube_prior_enroll_redcap),
+                day_of_intubation = day_of_intubation + days_intube_prior_enroll_redcap,
+                age = ifelse(!is.na(birth_date),
+                            yes = time_length(difftime(BAL_order_date, birth_date), unit = "years"),
+                            no = age))
+
+#factor by major pathogen
+major_pathogen_cols = c("any_viral_non_covid", "any_bacterial", 
+                        "covid_confirmed")
+pathogen = vector(mode = "character", length = nrow(complete_bal_data))
+pathogens_list = vector(mode = "list", length = nrow(complete_bal_data))
+for(i in 1:nrow(complete_bal_data))
+{
+  cur = complete_bal_data[i, major_pathogen_cols]
+  pathogens = as.character(na.omit(colnames(cur)[cur == TRUE]))
+  pathogens = gsub("^any_", "", pathogens)
+  pathogens = gsub("covid_confirmed", "SARS-CoV-2", pathogens)
+  if(length(pathogens) == 0)
+  {
+    pathogen[i] = NA
+  } else if(length(pathogens) > 0)
+  {
+    pathogens_list[[i]] = pathogens
+    if(length(pathogens) == 1)
+    {
+      pathogen[i] = pathogens
+    } else
+    {
+      pathogen[i] = "multiple"
+    }
+  }
+}
+pathogen = factor(pathogen)
+complete_bal_data$pathogen = pathogen
+complete_bal_data$pathogen_list = pathogens_list
+
+#factor by infection type
+pathogen_type_cols = c("any_bacterial", "any_viral")
+pathogen = vector(mode = "character", length = nrow(complete_bal_data))
+pathogens_list = vector(mode = "list", length = nrow(complete_bal_data))
+for(i in 1:nrow(complete_bal_data))
+{
+  cur = complete_bal_data[i, pathogen_type_cols]
+  pathogens = as.character(na.omit(colnames(cur)[cur == TRUE]))
+  pathogens = gsub("^any_", "", pathogens)
+  if(length(pathogens) == 0)
+  {
+    pathogen[i] = NA
+  } else if(length(pathogens) > 0)
+  {
+    pathogens_list[[i]] = pathogens
+    if(length(pathogens) == 1)
+    {
+      pathogen[i] = pathogens
+    } else
+    {
+      pathogen[i] = "multiple"
+    }
+  }
+}
+pathogen = factor(pathogen)
+complete_bal_data$infection_type = pathogen
+complete_bal_data$infection_type_list = pathogens_list
+
+#add broad diagnosis
+final_diagnosis = vector(mode = "character", length = nrow(complete_bal_data))
+for(i in 1:nrow(complete_bal_data))
+{
+  #no matter what, this stays the same (even with COVID)
+  if(!is.na(complete_bal_data$simplified_diagnosis[i]) && complete_bal_data$simplified_diagnosis[i] == "Non-Pneumonia Control")
+  {
+    final_diagnosis[i] = "Non-Pneumonia Control"
+  } else if(!is.na(complete_bal_data$simplified_diagnosis[i]) && complete_bal_data$simplified_diagnosis[i] == "Healthy Control")
+  {
+    final_diagnosis[i] = "Healthy Control"
+  } else if(complete_bal_data$covid_confirmed[i] == TRUE) #even if NA
+  {
+    final_diagnosis[i] = "COVID-19"
+  } else if(is.na(complete_bal_data$simplified_diagnosis[i]))
+  {
+    final_diagnosis[i] = NA
+  } else if(complete_bal_data$simplified_diagnosis[i] == "Pneumonia") #determine if viral
+  {
+    if((!is.na(complete_bal_data$any_viral_non_covid[i]) && complete_bal_data$any_viral_non_covid[i] == TRUE) || 
+       (!is.na(complete_bal_data$clin_cap[i]) && complete_bal_data$clin_cap[i] %in% c(2, 7)) || 
+       (!is.na(complete_bal_data$clin_hap[i]) && complete_bal_data$clin_hap[i] %in% c(4, 6)) ||
+       (!is.na(complete_bal_data$clin_vap[i]) && complete_bal_data$clin_vap[i] %in% c(4, 6)))
+    {
+      final_diagnosis[i] = "Other Viral Pneumonia"
+    } else
+    {
+      final_diagnosis[i] = "Other Pneumonia"
+    }
+  } else
+  {
+    final_diagnosis[i] = NA
+  }
+}
+final_diagnosis = factor(final_diagnosis,
+                         levels = c("Healthy Control", "Non-Pneumonia Control", "COVID-19", 
+                                    "Other Viral Pneumonia", "Other Pneumonia"))
+complete_bal_data$pna_type = final_diagnosis
+
+#remove any remaining PHI
+complete_bal_data = complete_bal_data %>% 
+  select(-c(clarity_west_mrn, birth_date))
+
+#spot fixes for incorrect entries
+complete_bal_data$binned_outcome[complete_bal_data$study_id == XXXXXX] = "Deceased"
+complete_bal_data$pna_type[complete_bal_data$study_id == XXXXXX] = "Non-Pneumonia Control"
+complete_bal_data$pna_type[complete_bal_data$study_id == XXXXXX] = "Other Viral Pneumonia"
+complete_bal_data$pna_type[complete_bal_data$study_id == XXXXXX] = "Other Viral Pneumonia"
+complete_bal_data$age[complete_bal_data$study_id == XXXXXX] = 31
+complete_bal_data$day_of_intubation[complete_bal_data$tc_pt_study_id == XXXXX] = 3
+bds_edits = read.csv("~/OneDrive - Northwestern University/Rogan/RGrant/SCRIPT/manuscript_1/201130_missing_metadata_BDS_edits.csv",
+                     ) %>% 
+  dplyr::select(-X)
+for(sample in bds_edits$tc_pt_study_id)
+{
+  #need to exclude NA study IDs or else we also get all of those
+  complete_bal_data$day_of_intubation[complete_bal_data$tc_pt_study_id == sample & !is.na(complete_bal_data$tc_pt_study_id)] =
+    bds_edits$day_of_intubation[bds_edits$tc_pt_study_id == sample]
+  if(is.na(complete_bal_data$age[complete_bal_data$tc_pt_study_id == sample & !is.na(complete_bal_data$tc_pt_study_id)]))
+  {
+    complete_bal_data$age[complete_bal_data$tc_pt_study_id == sample & !is.na(complete_bal_data$tc_pt_study_id)] = 
+      bds_edits$age[bds_edits$tc_pt_study_id == sample]
+  }
+}
+
+#adjust vent days to exclude days when extubated (useful for VAPs)
+complete_bal_data = complete_bal_data %>% 
+  dplyr::rename(BAL_order_accession_num = order_accession_num)
+adjusted = correct_vent_days(endpoints = edw_endpoints, bal_data = complete_bal_data)
+endpoints_long = adjusted$endpoints
+complete_bal_data = adjusted$bal
+
+#add superinfection
+complete_bal_data = complete_bal_data %>% 
+  #default to clinical adjudications from redcap where possible
+  mutate(super_type = case_when(pna_type %in% c("Other Pneumonia", "Non-Pneumonia Control") ~ NA_character_, #not applicable here
+                                (clin_cap == 2 | clin_hap == 4 | clin_vap == 4) ~ "Primary Only",
+                                ((any_nonviral == T | clin_cap == 7 | clin_hap == 6 | clin_vap == 6) & day_of_intubation <= 2 & day_of_intubation >= 0) ~ "Co-Infection",
+                                (any_nonviral == T | clin_cap == 7 | clin_hap == 6 | clin_vap == 6) ~ "Superinfection",
+                                is.na(any_nonviral) ~ NA_character_, 
+                                TRUE ~ "Primary Only"),
+         Superinfection = case_when(super_type %in% c("Co-Infection", "Superinfection") ~ "Superinfection",
+                                    super_type == "Primary Only" ~ "Primary Only")) %>% 
+group_by(study_id) %>% 
+  mutate(infection_category = case_when(pna_type == "Other Pneumonia" ~ NA_character_,
+                                        any(super_type == "Co-Infection") ~ "Co-Infection",
+                                        any(super_type == "Superinfection") ~ "Superinfection",
+                                        all(super_type == "Primary Only") ~ "Primary Only")) %>% 
+  ungroup()
+
+#remove extra diagnosis cols
+complete_bal_data = complete_bal_data %>% 
+  dplyr::select(-c(clin_cap, clin_vap, clin_hap)) %>% 
+  unique()
+
+#finally, fix ~2 remaining patients missing metadata   
+still_unk = complete_bal_data %>% 
+  dplyr::filter(is.na(ir_id)) %>% #always tracks with empty metadata
+  dplyr::filter(!is.na(tc_pt_study_id) & grepl("\\d{4}-BAL-\\d{2}", tc_pt_study_id)) #no fix for non-SCRIPT
+if(nrow(still_unk) > 0)
+{
+  stop("Error: missing data still")
+}
+
+# add comorbidities   
+immunocompromised = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/230308 U19SCRIPTVersion40-ComorbiditiesRAG_DATA_2023-03-08_1605.csv") %>% 
+  na.omit() %>% 
+  dplyr::mutate(Immunocompromised = factor(case_when(pt_immunocomp == 0 ~ "Not Immunocompromised",
+                                                     pt_immunocomp == 1 ~ "Immunocompromised",
+                                                     TRUE ~ NA_character_)),
+                pt_study_id = as.character(pt_study_id)) %>% 
+  dplyr::select(-pt_immunocomp)
+complete_bal_data = complete_bal_data %>% 
+  left_join(., immunocompromised, 
+            by = c("study_id" = "pt_study_id"),
+            na_matches = "never")
+
+binarize = function(x){
+  out = factor(case_when(x == 0 ~ "Not Diagnosed",
+                         x > 0 ~ "Diagnosed",
+                         TRUE ~ NA_character_))
+  return(out)
+}
+comorbidities = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/230308 COVID patients admitted to ICU CCI.csv",
+                         skip = 2) %>% 
+  dplyr::mutate(admission_datetime = as.Date(hosp_admsn_time, format = "%m/%d/%Y %H:%M")) %>% 
+  dplyr::select(ir_id, admission_datetime, Myocardial_infarction:Charlson_comorbidity_index) %>% 
+  #these should be true zeros
+  replace_na(replace = list(Myocardial_infarction = 0, Congestive_heart_failure = 0,
+                            Peripheral_vascular_disease = 0, Cerebrovascular_disease = 0,
+                            Dementia = 0, Chronic_pulmonary_disease = 0,
+                            Rheumatic_disease = 0, Peptic_ulcer_disease = 0,
+                            Liver_disease = 0, Diabetes = 0, 
+                            Hemiplagia_or_paraplegia = 0, Renal_disease = 0,
+                            Cancer = 0, AIDS_HIV = 0)) %>% 
+  dplyr::mutate(ir_id = as.character(ir_id),
+                across(Myocardial_infarction:AIDS_HIV, .fns = binarize)) %>% 
+  unique()
+rm(binarize)
+
+complete_bal_data = complete_bal_data %>% 
+  left_join(., comorbidities, 
+            na_matches = "never")
+
+
+#merge with flow data
+flow_data = flow_data %>% 
+  dplyr::mutate(tc_pt_study_id = substring(Sample, 10, 20)) %>% 
+  left_join(.,
+            complete_bal_data,
+            by = c("ID" = "study_id", "tc_pt_study_id"),
+            na_matches = "never")
+
+#add extra columns
+flow_data = flow_data %>% 
+  rowwise() %>% 
+  dplyr::mutate(infection_detected = factor(!is.null(organism_quantity))) %>% 
+  ungroup() %>% 
+  unique() %>% 
+  dplyr::filter(!duplicated(Sample)) #some must have duplicate barcodes
+
+#cast into long form
+flow_data = unique(flow_data)
+mfi_cols = colnames(flow_data)[grepl("MFI", colnames(flow_data), ignore.case = T)]
+percentage_cols = colnames(flow_data)[grepl("percent", colnames(flow_data), ignore.case = T)]
+flow_data_long = flow_data %>% 
+  pivot_longer(cols = c(all_of(mfi_cols), all_of(percentage_cols)), 
+               names_to = "flow_parameter",
+               values_to = "value") %>% 
+  arrange(ID, day_of_intubation) #for easy viewing later
+flow_data_long$flow_parameter = factor(flow_data_long$flow_parameter)
+
+#make separate item for only script patients
+#remove bad data from EDW, patients past cutoff
+script_bal_data = complete_bal_data %>% 
+  dplyr::filter(!is.na(tc_pt_study_id) & #only known script samples
+                  !(tc_pt_study_id %in% discards))
+```
+            
+## Mark samples sequenced by bulk or single-cell (macrophages)   
+```{r}
+bulk_md = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/201023_bulk_md_for_counting.csv",
+                     ) %>% 
+  dplyr::select(-X) %>% 
+  dplyr::rename(bulk_am_tube = sample) %>% 
+  mutate(bulk_am_sequenced = T)
+scRNA_samples = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/210517 01script-single-cell.csv",
+                     ) %>% 
+  dplyr::select(-X) %>% 
+  dplyr::rename(scRNA_sequenced = sc_done)
+```
+
+# Integrity checks   
+## Duplicated BALs   
+```{r}
+dups = script_bal_data %>% 
+  dplyr::filter(duplicated(tc_pt_study_id)) %>% 
+  .$tc_pt_study_id
+
+dups_all = script_bal_data %>% 
+  dplyr::filter(tc_pt_study_id %in% dups) %>% 
+  arrange(tc_pt_study_id)
+if(nrow(dups_all) > 0){
+  stop("Error: sample duplications")
+}
+
+dup_pts = patient_data %>% 
+  dplyr::filter(ir_id %in% dups_all$ir_id)
+if(nrow(dup_pts) > 0){
+  stop("Error: patient duplications")
+}
+```
+   
+# Quick summaries   
+## Enrollment   
+```{r}
+enrollment = script_bal_data %>% 
+  dplyr::select(study_id, pna_type, age, race = races, ethnicity, sex = gender) %>% 
+  unique()
+
+write.csv(enrollment, "~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/220816_script_enrollment.csv", 
+          row.names = F, quote = F)
+
+enrollment
+```
+
+            
+# Export   
+## Complete   
+```{r eval=FALSE}
+
+outname = paste0("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/",
+                 Sys.Date(),
+                 "_",
+                 "SCRIPT_cytokines_metadata.rds")
+saveRDS(object = script_bal_data,
+        file = outname)
+outname = paste0("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/",
+                 Sys.Date(),
+                 "_",
+                 "SCRIPT_flow_plus_cytokines_metadata.rds")
+saveRDS(object = flow_data,
+        file = outname)
+
+#for subsetting later
+observations = table(flow_data$patient_id)
+#add finite days
+flow_data$finite_day_of_intubation = flow_data$day_of_intubation
+flow_data$finite_day_of_intubation[is.infinite(flow_data$finite_day_of_intubation)] = NA
+
+flow_data
+```   
+   
+## CSV version   
+```{r eval=FALSE}
+csv_version = script_bal_data %>% 
+  dplyr::select(where(~ !is.list(.x)))
+write.csv(csv_version, "~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/220502_complete_SCRIPT_bal_data.csv")
+```
+
+   
+## For proteomics   
+```{r eval=FALSE}
+proteomics_samples = read_excel("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/220103 Proteomics samples.xlsx", col_names = F) %>%
+  dplyr::rename(tc_pt_study_id = ...1) %>% 
+  dplyr::mutate(patient = substring(tc_pt_study_id, 1, 4))
+proteomics_patients = unique(proteomics_samples$patient)
+
+proteomics_md = script_bal_data %>% 
+  dplyr::filter(tc_pt_study_id %in% proteomics_samples$tc_pt_study_id) %>% 
+  dplyr::select_if(~!is.list(.))
+write.csv(proteomics_md, "~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/230131_proteomics_metadata.csv")
+
+proteomics_md_flow = flow_data %>% 
+  dplyr::filter(tc_pt_study_id %in% proteomics_samples$tc_pt_study_id) %>% 
+  dplyr::select_if(~!is.list(.))
+write.csv(proteomics_md, "~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/230131_proteomics_metadata_with_flow.csv")
+
+simple = proteomics_md %>% 
+  dplyr::select(tc_pt_study_id, study_id, day_of_intubation, pna_type, Superinfection) %>% 
+  dplyr::arrange(tc_pt_study_id)
+write.csv(simple, "~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/220510_proteomics_metadata_simplified.csv")
+```

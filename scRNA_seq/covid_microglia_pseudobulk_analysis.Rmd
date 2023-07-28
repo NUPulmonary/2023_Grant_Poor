@@ -1,0 +1,287 @@
+---
+title: "Microglia pseudobulk deep analysis"
+output: html_notebook
+---
+   
+# Setup   
+## Import packages
+```{r setup}
+library(tidyverse)
+library(ggsci)
+library(Cairo)
+library(biomaRt)
+library(DESeq2)
+library(parallel)
+library(doParallel)
+library(BiocParallel)
+library(ggsignif)
+library(fgsea)
+
+#custom scripts
+source("~/utils/R/Seurat_pseudobulk_DEA.R")
+source("~/utils/R/pretty_MA_plot.R")
+source("~/utils/R/plotPCA_manual.R")
+source("~/utils/R/get_tidy_counts.R")
+
+gene_conv = read.table(gzfile("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_batch1/cellranger/SC224/outs/filtered_feature_bc_matrix/features.tsv.gz"), 
+                       col.names = c("id", "feature", "type", "assay")) %>% 
+  dplyr::select(-c(type, assay)) %>% 
+  dplyr::mutate(ensembl_gene_id = gsub("GRCh38_______________", "", id),
+                external_gene_name = gsub("GRCh38_______________", "", feature),
+                id = gsub("_______________", "-", id),
+                feature = gsub("_______________", "-", feature))
+```
+   
+## Microglia MA   
+### Import   
+```{r}
+microglia_des = readRDS("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220610_pseudobulk_analysis/220610_pseudobulk_celltype_Microglia_subset_des.rds")
+
+register(MulticoreParam(12))
+```
+   
+### PCA   
+```{r}
+pca = plotPCA_manual(object = vst(microglia_des), 
+                     intgroup = "main_group", 
+                     pcs = 3, 
+                     ntop = 100,
+                     merge_metadata = TRUE,
+                     return_loadings = TRUE, 
+                     mart_name = "hsapiens")
+
+ggplot(pca$data, aes(x = PC1, y = PC2, color = main_group)) +
+   geom_point(size = 3)  +
+   labs(x = paste0("PC1 (", pca$percent_var$percent_var[1], "% of variance explained)"),
+        y = paste0("PC2 (", pca$percent_var$percent_var[2], "% of variance explained)")) +
+   theme_bw(base_family = "Arial") +
+   scale_color_npg()
+ggplot(pca$data, aes(x = PC2, y = PC3, color = main_group)) +
+   geom_point(size = 3) +
+   labs(x = paste0("PC2 (", pca$percent_var$percent_var[2], "% of variance explained)"),
+        y = paste0("PC3 (", pca$percent_var$percent_var[3], "% of variance explained)")) +
+   theme_bw(base_family = "Arial") +
+   scale_color_npg()
+```  
+   
+Some separation but definitely not driven entirely by COVID. Not unexpected this way.   
+   
+### Find best fit   
+```{r}
+parametric = DESeq(microglia_des,
+                   fitType = "parametric",
+                   parallel = T)
+plotDispEsts(parametric)
+
+local = DESeq(microglia_des,
+              fitType = "local",
+              parallel = T)
+
+dge = local
+rm(local, parametric)
+```   
+   
+Local looks more reasonable
+   
+### Perform DEA
+```{r}
+microglia_dge = DESeq(microglia_des, 
+                      fitType = "local", 
+                      parallel = T)
+
+microglia_res = results(microglia_dge,
+                         contrast = c("main_group", "COVID-19", "Control"),
+                         alpha = 0.05,
+                         parallel = T) %>% 
+  as.data.frame()
+
+microglia_hits = microglia_res %>% 
+  rownames_to_column("external_gene_name") %>% 
+  mutate(external_gene_name = gsub("GRCh38-", "", external_gene_name)) #for easy conversion
+
+write.csv(microglia_res, "/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220808_microglia_bulk_results.csv")
+
+interesting_hits = microglia_hits %>% 
+  dplyr::filter(padj < 0.05 & !(grepl("^A[PLC]|LINC", external_gene_name))) %>% #remove noncoding
+  .$external_gene_name %>% 
+  sort()
+```   
+   
+### MA Plot   
+```{r}
+microglia_covid_MA = pretty_MA_plot(results = microglia_hits, 
+               mart_name = "hsapiens_gene_ensembl", 
+               convert_ids = F,
+               name_col = "external_gene_name",
+               id_col = "external_gene_name",
+               max_overlaps = 1000, 
+               label_text_size = (16 / .pt),
+               genes = interesting_hits,
+               random_seed = 12345) +
+  theme(legend.position = "none",
+        axis.text.x = element_text(size = 24),
+        axis.text.y = element_text(size = 24),
+        axis.title.x = element_text(size = 36),
+        axis.title.y = element_text(size = 36),
+         strip.text = element_text(size = 24))
+```
+
+   
+### Export   
+```{r}
+CairoPDF("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220721_microglia_covid_MA.pdf",
+    width = 9,
+    height = 8, 
+    family = "Arial")
+microglia_covid_MA
+dev.off()
+CairoPNG("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220721_microglia_covid_MA.png",
+    width = 9,
+    height = 8, 
+    units = "in",
+    dpi = 300,
+    family = "Arial")
+microglia_covid_MA
+dev.off()
+
+saveRDS(microglia_covid_MA, "/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220721_microglia_covid_MA.rds")
+```
+   
+## Plot individual values   
+### Extract data   
+```{r}
+goi = c("MKI67", "CENPF", "CDKN1A")
+
+comps = microglia_hits %>% 
+  dplyr::filter(external_gene_name %in% goi) %>% 
+  mutate(annot = format(padj, digits = 2, scientific = T),
+         xmin = "COVID-19", 
+         xmax = "Control") %>% 
+  dplyr::select(external_gene_name, annot, xmin, xmax)
+
+genes = counts(microglia_dge, normalized = T) %>% 
+  as.data.frame(row.names = NULL) %>% 
+  rownames_to_column("external_gene_name") %>% 
+  mutate(external_gene_name = gsub("GRCh38-", "", external_gene_name)) %>% 
+  dplyr::filter(external_gene_name %in% goi) %>% 
+  pivot_longer(cols = 2:ncol(.), values_to = "counts", names_to = "sample")
+
+md = colData(microglia_dge) %>% 
+  as.data.frame(row.names = NULL) %>% 
+  rownames_to_column("sample")
+
+division_counts = left_join(genes, md, by = "sample") %>% 
+  left_join(., gene_conv) # for visualization with symbols
+
+#add y value to significance bars
+max_counts = division_counts %>% 
+  group_by(external_gene_name) %>% 
+  dplyr::summarize(max_counts = max(counts))
+comps = left_join(comps, max_counts) %>% 
+  dplyr::mutate(yval = max_counts * 1.1)
+```
+   
+### Plot   
+```{r}
+division_boxplots = ggplot(division_counts, aes(x = main_group, fill = main_group, y = counts)) +
+  facet_wrap(~ external_gene_name, scales = "free_y") +
+  geom_boxplot(outlier.shape = NA) +
+   geom_jitter(width = 0.2) +
+   scale_fill_npg(name = "Group") +
+   theme_bw() +
+   theme(legend.position = "none",
+        axis.text.x = element_text(size = 24),
+        axis.text.y = element_text(size = 24),
+        axis.title.x = element_text(size = 36),
+        axis.title.y = element_text(size = 36),
+         strip.text = element_text(size = 24)) +
+  labs(x = "", y = "Bulk Gene Counts") +
+  geom_signif(inherit.aes = F, 
+              data = comps,
+              aes(xmin = xmin, xmax = xmax, annotations = annot, y_position = yval),
+              tip_length = 0,
+              textsize = 9, 
+              manual=TRUE) 
+
+division_boxplots
+```
+   
+### Export   
+```{r}
+CairoPDF("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220721_microglia_covid_division_hits.pdf",
+    width = 9,
+    height = 4, 
+    family = "Arial")
+division_boxplots
+dev.off()
+CairoPNG("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220721_microglia_covid_division_hits.png",
+    width = 9,
+    height = 4, 
+    units = "in",
+    dpi = 300,
+    family = "Arial")
+division_boxplots
+dev.off()
+
+saveRDS(division_boxplots, "/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/220721_microglia_covid_division_hits.rds")
+```   
+   
+# GSEA   
+## Pull msigdb lists   
+```{r}
+hallmark = gmtPathways("/projects/b1038/Pulmonary/rgrant/resources/h.all.v7.5.1.symbols.gmt")
+```  
+   
+## Get gene ranks   
+```{r}
+ranks = microglia_hits %>% 
+  dplyr::select(external_gene_name, stat) %>% 
+  dplyr::filter(!is.na(stat)) %>% 
+  dplyr::arrange(desc(stat)) %>% 
+  deframe()
+```
+   
+## Run on all gene lists   
+```{r}
+set.seed(12345)
+gsea_res = fgseaMultilevel(pathways = hallmark,
+                           minSize = 2, 
+                           stats = ranks, 
+                           nproc = 1)
+
+gsea_res %>% 
+  dplyr::arrange(padj) %>% 
+  dplyr::filter(padj < 0.05)
+```
+   
+## Plot some hits   
+### NFkB -- Top hit
+```{r}
+enrichment_plot = plotEnrichment(pathway = hallmark$HALLMARK_TNFA_SIGNALING_VIA_NFKB,
+                                 stats = ranks) +
+  annotate(x = 10000, y = 0.5, geom = "text", size = 9,
+           label = paste0("q = ", format(gsea_res$padj[gsea_res$pathway == "HALLMARK_TNFA_SIGNALING_VIA_NFKB"], 
+                                         digits = 3, scientific = T))) +
+  labs(x = "Gene Rank", y = "Enrichment Score (COVID-19 / Control)") +
+  #to better match related plots
+  facet_wrap(facets = ~"Hallmark TNF-α Signaling Via NFKB\n(M5890)") +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(size = 24),
+        axis.text.y = element_text(size = 24),
+        axis.title.x = element_text(size = 36),
+        axis.title.y = element_text(size = 36),
+         strip.text = element_text(size = 36),
+        strip.background = element_blank())
+
+enrichment_plot
+
+CairoPDF("/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/230620_NFkB_GSEA.pdf",
+    width = 9,
+    height = 6,
+    family = "Arial")
+enrichment_plot
+dev.off()
+
+saveRDS(enrichment_plot, "/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/2021_human_microglia_scRNA/230620_NFkB_GSEA.rds")
+```   

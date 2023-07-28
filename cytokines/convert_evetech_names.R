@@ -1,0 +1,16 @@
+convert_evetech_names = function(x)
+{
+  x = gsub("SDF-1α\\+β", "SDF-1ab", x)
+  x = gsub("FLT-3L", "Flt-3l", x)
+  x = gsub("GROα", "GRO", x)
+  x = gsub("IFN-α2", "IFNa2", x)
+  x = gsub("γ", "g", x)
+  x = gsub("IL-1α", "IL-1a", x)
+  x = gsub("β", "b", x)
+  x = gsub("MIP-1α", "MIP-1a", x)
+  x = gsub("δ", "d", x)
+  x = gsub("TGFα", "TGF-a", x)
+  x = gsub("TNFα", "TNFa", x)
+  x = gsub("VEGF-A", "VEGF", x)
+  x = gsub("12-p", "12-P", x)
+}

@@ -1,0 +1,13 @@
+snakemake==6.9.1
+scvi-tools==0.14.3
+scrublet==0.2.3
+-e git+https://github.com/broadinstitute/CellBender.git@v0.2.0#egg=cellbender
+torch-1.12.1+cu113-cp39-cp39-linux_x86_64.whl
+scanpy==1.8.2
+sccoda==0.1.6
+cellbrowser==1.2.1
+pyro-ppl==1.8.0
+plotnine==0.8.0
+torchmetrics==0.7.3
+scVelo==0.2.5
+velocyto==0.17.15
