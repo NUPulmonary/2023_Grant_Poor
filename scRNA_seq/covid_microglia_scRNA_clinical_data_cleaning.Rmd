@@ -117,7 +117,7 @@ raw = read_excel(XXXXX,
 ## Add SCRIPT data?   
 ### Identify any SCRIPT overlap   
 ```{r}
-script_pts = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/220502 STU00204868_subjects_05_02_2022.csv",
+script_pts = read.csv("~/OneDrive - Northwestern University/Misharin_Lab/SCRIPT/220502 XXXXX_subjects_05_02_2022.csv",
                       na.strings = c("", "NA"),
                       strip.white = T,
                       check.names = T, 

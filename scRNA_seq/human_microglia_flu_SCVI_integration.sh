@@ -12,4 +12,4 @@
 
 module load R/4.1.1
 
-Rscript /home/rag0151/aging_microglia_flu/230118_human_microglia_flu_SCVI_integration_cleaned.r
+Rscript /home/XXXXX/aging_microglia_flu/230118_human_microglia_flu_SCVI_integration_cleaned.r

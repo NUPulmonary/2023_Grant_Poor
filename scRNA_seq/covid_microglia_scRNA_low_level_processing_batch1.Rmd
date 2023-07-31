@@ -30,8 +30,8 @@ cd /projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/merged_data/EBV
 screen
 source /projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/human_microglia_venv/bin/activate
 
-snakemake -s /home/rag0151/utils/snakemake/pipelines/cellranger_pipeline_7 \
---cluster-config '/home/rag0151/.slurm.json' \
+snakemake -s /home/XXXXX/utils/snakemake/pipelines/cellranger_pipeline_7 \
+--cluster-config '/home/XXXXX/.slurm.json' \
 --config sample_csv_path='/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/raw/samplesheet_human_microglia_final.csv' \
 data_dir='/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final' \
 cellranger_dir='/projects/b1038/Pulmonary/bin/cellranger-7.0.1' \
@@ -45,8 +45,8 @@ gex_fastqs='None' \
 -j 1000 \
 -n
 
-snakemake -s /home/rag0151/utils/snakemake/pipelines/cellranger_pipeline_7 \
---cluster-config '/home/rag0151/.slurm.json' \
+snakemake -s /home/XXXXX/utils/snakemake/pipelines/cellranger_pipeline_7 \
+--cluster-config '/home/XXXXX/.slurm.json' \
 --config sample_csv_path='/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/raw/samplesheet_human_microglia_final.csv' \
 data_dir='/projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_microglia_final' \
 cellranger_dir='/projects/b1038/Pulmonary/bin/cellranger-7.0.1' \
@@ -123,14 +123,14 @@ cd /projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/data/human_micr
 screen
 source /projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/human_microglia_venv/bin/activate
 snakemake -s ~/aging_microglia_flu/230115_Snakefile_cellbender_final \
---cluster-config '/home/rag0151/.slurm.json' \
+--cluster-config '/home/XXXXX/.slurm.json' \
 --cluster /projects/b1038/tools/snakemake/cluster.py \
 -j 1000 \
 -F \
 -n
 
 snakemake -s ~/aging_microglia_flu/230115_Snakefile_cellbender_final \
---cluster-config '/home/rag0151/.slurm.json' \
+--cluster-config '/home/XXXXX/.slurm.json' \
 --cluster /projects/b1038/tools/snakemake/cluster.py \
 -j 1000 \
 -F
@@ -454,8 +454,8 @@ cd /projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq
 screen
 source /projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/human_microglia_venv/bin/activate
 module purge all
-snakemake -s /home/rag0151/aging_microglia_flu/230109_snakefile_souporcell \
---cluster-config '/home/rag0151/.slurm.json' \
+snakemake -s /home/XXXXX/aging_microglia_flu/230109_snakefile_souporcell \
+--cluster-config '/home/XXXXX/.slurm.json' \
 --cluster /projects/b1038/tools/snakemake/cluster.py \
 -j 1000 \
 -n
@@ -639,14 +639,14 @@ source /projects/b1038/Pulmonary/rgrant/microglia_aging_flu/scRNAseq/human_micro
 module purge all
 module load gcc/11.2.0 #required for annoy
 snakemake -s ~/aging_microglia_flu/230109_Snakefile_scrublet \
---cluster-config '/home/rag0151/.slurm.json' \
+--cluster-config '/home/XXXXX/.slurm.json' \
 --cluster /projects/b1038/tools/snakemake/cluster.py \
 -j 1000 \
 -F \
 -n
 
 snakemake -s ~/aging_microglia_flu/230109_Snakefile_scrublet \
---cluster-config '/home/rag0151/.slurm.json' \
+--cluster-config '/home/XXXXX/.slurm.json' \
 --cluster /projects/b1038/tools/snakemake/cluster.py \
 -j 1000 \
 -F
