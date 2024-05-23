@@ -1,0 +1,182 @@
+---
+title: "GRCh38 + SARS-CoV-2 + EBV1 genome generation"
+output: html_notebook
+---
+
+# Setup   
+## Goals   
+   
+Generate a hyrbid genome with the following components for scRNA-seq:   
+1. Human (10X genomics version of GRCh38)   
+2. SARS-CoV-2 (NC_45512.2)   
+3. EBV1 / Human gammaherpesvirus 4.1 (NC_007605.1)   
+   
+## Load packages   
+```{r setup}
+library(rtracklayer)
+library(tidyverse)
+```
+   
+## Download genomes   
+```{bash eval=FALSE}
+cd /Pulmonary/genomes
+
+#SARS-CoV-2 (NC_45512.2)   
+wget 'https://www.ncbi.nlm.nih.gov/sviewer/viewer.cgi?tool=portal&save=file&log$=seqview&db=nuccore&report=fasta&id=1798174254&extrafeat=null&conwithfeat=on&hide-cdd=on' -O NC_45512.2.fa
+wget 'https://www.ncbi.nlm.nih.gov/sviewer/viewer.cgi?tool=portal&save=file&log$=seqview&db=nuccore&report=gff3&id=1798174254&conwithfeat=on&withparts=on&hide-cdd=on' -O NC_45512.2.gff3
+
+#EBV1 / Human gammaherpesvirus 4.1 (NC_007605.1)   
+wget 'https://www.ncbi.nlm.nih.gov/sviewer/viewer.cgi?tool=portal&save=file&log$=seqview&db=nuccore&report=fasta&id=82503188&extrafeat=null&conwithfeat=on&hide-cdd=on' -O NC_007605.1.fa
+wget 'https://www.ncbi.nlm.nih.gov/sviewer/viewer.cgi?tool=portal&save=file&log$=seqview&db=nuccore&report=gff3&id=82503188&extrafeat=null&conwithfeat=on&hide-cdd=on' -O NC_007605.1.gff3
+
+#GRCh38 (cellranger version 2020-A)
+wget 'https://cf.10xgenomics.com/supp/cell-exp/refdata-gex-GRCh38-2020-A.tar.gz'
+tar -xf refdata-gex-GRCh38-2020-A.tar.gz
+rm refdata-gex-GRCh38-2020-A.tar.gz
+```
+   
+   
+# Generate GTFs   
+## Subset to conding genes (and add SARS-CoV-2 antisense)      
+```{r eval=FALSE}
+#CoV2 (NC_45512.2)   
+cov2_gff = readGFF("/Pulmonary/genomes/NC_45512.2.gff3")
+cov2_gff = subset(cov2_gff, type == "gene") #this is all we really care about
+cov2_antisense = data.frame("NC_045512.2", "RefSeq", "gene", 1, 29903,
+                      NA, "-", NA, "SARS_CoV_2_antisense_genome", "",
+                      NA, NA, NA, "Gene", NA,
+                      NA, NA, NA, NA, "SARS_CoV_2_antisense_genome",
+                      "SARS_CoV_2_antisense_genome", "antisense", NA, NA, NA,
+                      NA, NA, NA, NA, NA,
+                      NA)
+colnames(cov2_antisense) = names(cov2_gff)
+cov2_gff = rbind(cov2_gff,
+                 cov2_antisense)
+cov2_gff = cov2_gff[order(cov2_gff$start, decreasing = F), ] #have to sort for success
+export.gff3(cov2_gff, 
+            "/Pulmonary/genomes/NC_45512.2_edited.gff3")
+```   
+   
+# "Circularize" EBV1 genome   
+   
+LMP-2A and LMP-2B span past the "end" of the EBV1 genome, leading to errors during creation of the reference. The best fix I can see is to append the minimal number of nucleotides to the end of the FASTA to rescue these genes, at the expense of some multimapping. Interestingly, however, the entirety of this region (1 - 5,856) contains a single gene (BNRF1). I think it may be best to simply move this to the end of the genome and fill in the beginning with Ns to preserve locations for the remaining 93 genes.   
+   
+## Edit genome FASTA   
+```{r eval=FALSE}
+ebv1_fasta = readChar("/Pulmonary/genomes/NC_007605.1.fa", 
+                      nchars = file.info("/Pulmonary/genomes/NC_007605.1.fa")$size) %>% 
+  #newline characters make positions difficult to determine
+  gsub("\n", "", .)
+
+#save header for later
+header_start = 1
+header_end = regexpr("genome", ebv1_fasta) + 5
+header = substring(ebv1_fasta, header_start, header_end)
+ebv1_fasta_edited = gsub(header, "", ebv1_fasta)
+original_length = nchar(ebv1_fasta_edited)
+header = paste0(header, "\n")
+
+#copy from 1 to the end of BNRF1
+ebv1_start = regexpr("genome", ebv1_fasta) + 6
+bnrf1_end = ebv1_start + 5855
+#confirmed against https://www.ncbi.nlm.nih.gov/nuccore/NC_007605.1?from=1691&to=5856&report=fasta
+chunk_to_move = substring(ebv1_fasta, ebv1_start, bnrf1_end)
+
+#make a run of Ns to fill the gap
+dummy_chunk = rep("N", nchar(chunk_to_move)) %>% 
+  paste(., collapse = "")
+
+#perform replacement
+ebv1_fasta_edited = gsub(pattern = chunk_to_move, replacement = dummy_chunk, ebv1_fasta_edited, fixed = T)
+nchar(ebv1_fasta_edited) == original_length #TRUE
+
+#append bnrf1 chunk to end
+ebv1_fasta_edited = paste0(ebv1_fasta_edited, chunk_to_move)
+ebv1_final_sequence = ebv1_fasta_edited #for later use
+
+#add back the header
+ebv1_fasta_edited = paste0(header, ebv1_fasta_edited)
+
+#output final result
+writeLines(ebv1_fasta_edited, "/Pulmonary/genomes/NC_007605.1_edited.fa")
+```
+   
+I spot checked several genes, including BNRF1, LMP-2a, and BPLF1. The positions are preserved, except where explicitly changed (BNRF1). LMP-2A also now reads through perfectly.   
+   
+## Edit EBV1 GFF to match   
+```{r eval=FALSE}
+#also confirmed with snapgene
+new_bnrf1_start = regexpr(chunk_to_move, ebv1_final_sequence, fixed = T)
+new_bnrf1_end = new_bnrf1_start + nchar(chunk_to_move) - 1
+
+#EBV1 / Human gammaherpesvirus 4.1 (NC_007605.1)
+ebv1_gff = readGFF("/Pulmonary/genomes/NC_007605.1.gff3")
+ebv1_gff = subset(ebv1_gff, type == "gene") 
+#edit bnrf1 start and end
+bnrf1_loc = which(ebv1_gff[["Name"]] == "BNRF1")
+ebv1_gff[["start"]][bnrf1_loc] = new_bnrf1_start 
+ebv1_gff[["end"]][bnrf1_loc] = new_bnrf1_end
+
+#reorder to update
+ebv1_gff = ebv1_gff[order(ebv1_gff$start, decreasing = F), ] #have to sort for success
+
+export.gff3(ebv1_gff,
+            "/Pulmonary/genomes/NC_007605.1_edited.gff3")
+```
+
+      
+# Convert GFF3 to GTF      
+```{bash eval=FALSE}
+module load gffread/0.9.11
+
+# CoV2
+gffread  \
+'/Pulmonary/genomes/NC_45512.2_edited.gff3' \
+-T \
+-F \
+ --gene2exon \
+-o '/Pulmonary/genomes/NC_45512.2_edited.gtf'
+
+#EBV1
+gffread  \
+'/Pulmonary/genomes/NC_007605.1_edited.gff3' \
+-T \
+-F \
+ --gene2exon \
+-o '/Pulmonary/genomes/NC_007605.1_edited.gtf'
+```
+   
+# Make cellranger reference   
+## Submit mkref job   
+   
+~/aging_microglia_flu/220221_grch38_ebv1_cov2_mkref.sh   
+```{bash eval=FALSE}
+#!/bin/bash
+#SBATCH -A b1042
+#SBATCH -p genomics
+#SBATCH -t 4:00:00
+#SBATCH -N 1
+#SBATCH --mem=48G
+#SBATCH --ntasks-per-node=12
+#SBATCH --mail-user=rogangrant2022@u.northwestern.edu
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --job-name='220221_grch38_ebv1_cov2_mkref'
+
+module purge
+module load cellranger/6.1.2
+
+cd `dirname {output}`
+cellranger mkref \
+--genome 'GRCh38' \
+--fasta '/Pulmonary/genomes/refdata-gex-GRCh38-2020-A/fasta/genome.fa' \
+--genes '/Pulmonary/genomes/refdata-gex-GRCh38-2020-A/genes/genes.gtf' \
+--genome 'SARS-CoV-2_NC45512.2' \
+--fasta '/Pulmonary/genomes/NC_45512.2.fa' \
+--genes '/Pulmonary/genomes/NC_45512.2_edited.gtf' \
+--genome 'EBV1_NC007605.1' \
+--fasta '/Pulmonary/genomes/NC_007605.1_edited.fa' \
+--genes '/Pulmonary/genomes/NC_007605.1_edited.gtf' \
+--nthreads 12 \
+--memgb 48
+```
+
